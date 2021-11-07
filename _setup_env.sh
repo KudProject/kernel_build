@@ -69,7 +69,7 @@ export UNSTRIPPED_MODULES_ARCHIVE=unstripped_modules.tar.gz
 
 echo "========================================================"
 echo "= build config: ${ROOT_DIR}/${BUILD_CONFIG}"
-cat ${ROOT_DIR}/${BUILD_CONFIG}
+#cat ${ROOT_DIR}/${BUILD_CONFIG}
 
 export TZ=UTC
 export LC_ALL=C
