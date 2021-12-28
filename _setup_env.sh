@@ -236,6 +236,10 @@ else
     tool_args+=("LD=${LD}" "HOSTLD=${LD}")
   fi
 
+  if [ -n "${AR}" ]; then
+    tool_args+=("AR=${AR}")
+  fi
+
   if [ -n "${NM}" ]; then
     tool_args+=("NM=${NM}")
   fi
@@ -243,12 +247,24 @@ else
   if [ -n "${OBJCOPY}" ]; then
     tool_args+=("OBJCOPY=${OBJCOPY}")
   fi
+
+  if [ -n "${OBJDUMP}" ]; then
+    tool_args+=("OBJDUMP=${OBJDUMP}")
+  fi
+
+  if [ -n "${STRIP}" ]; then
+    tool_args+=("STRIP=${STRIP}")
+  fi
 fi
 
 if [ -n "${LLVM_IAS}" ]; then
   tool_args+=("LLVM_IAS=${LLVM_IAS}")
   # Reset $AS for the same reason that we reset $CC etc above.
   AS=clang
+else
+  if [ -n "${AS}" ]; then
+    tool_args+=("AS=${AS}")
+  fi
 fi
 
 if [ -n "${DEPMOD}" ]; then
