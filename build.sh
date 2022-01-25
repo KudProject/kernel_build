@@ -629,6 +629,10 @@ export CLANG_TRIPLE CROSS_COMPILE CROSS_COMPILE_COMPAT CROSS_COMPILE_ARM32 ARCH 
 
 TOOL_ARGS=()
 
+if [ -n "${HOSTCC}" ]; then
+  TOOL_ARGS+=("HOSTCC=${HOSTCC}")
+fi
+
 # LLVM=1 implies what is otherwise set below; it is a more concise way of
 # specifying CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy <etc>, for
 # newer kernel versions.
@@ -637,8 +641,6 @@ if [[ -n "${LLVM}" ]]; then
   # Reset a bunch of variables that the kernel's top level Makefile does, just
   # in case someone tries to use these binaries in this script such as in
   # initramfs generation below.
-  HOSTCC=clang
-  HOSTCXX=clang++
   CC=clang
   LD=ld.lld
   AR=llvm-ar
@@ -649,10 +651,6 @@ if [[ -n "${LLVM}" ]]; then
   OBJSIZE=llvm-size
   STRIP=llvm-strip
 else
-  if [ -n "${HOSTCC}" ]; then
-    TOOL_ARGS+=("HOSTCC=${HOSTCC}")
-  fi
-
   if [ -n "${CC}" ]; then
     TOOL_ARGS+=("CC=${CC}")
     if [ -z "${HOSTCC}" ]; then
