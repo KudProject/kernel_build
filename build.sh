@@ -857,16 +857,16 @@ fi
 if [ -n "${ABI_DEFINITION}" ]; then
   echo "========================================================"
   echo " Copying abi definition to ${ABI_XML}"
-  pushd $ROOT_DIR/$KERNEL_DIR
+  pushd $ROOT_DIR/$KERNEL_DIR >/dev/null
     cp "${ABI_DEFINITION}" ${ABI_XML}
-  popd
+  popd >/dev/null
 fi
 
 # Copy the abi symbol list file from the sources into the dist dir
 if [ -n "${KMI_SYMBOL_LIST}" ]; then
   ${ROOT_DIR}/build/copy_symbols.sh "$ABI_SL" "$ROOT_DIR/$KERNEL_DIR" \
     "${KMI_SYMBOL_LIST}" ${ADDITIONAL_KMI_SYMBOL_LISTS}
-  pushd $ROOT_DIR/$KERNEL_DIR
+  pushd $ROOT_DIR/$KERNEL_DIR >/dev/null
   if [ "${TRIM_NONLISTED_KMI}" = "1" ]; then
       # Create the raw symbol list
       cat ${ABI_SL} | \
@@ -890,7 +890,7 @@ if [ -n "${KMI_SYMBOL_LIST}" ]; then
       echo "ERROR: KMI_SYMBOL_LIST_STRICT_MODE requires TRIM_NONLISTED_KMI=1" >&2
     exit 1
   fi
-  popd # $ROOT_DIR/$KERNEL_DIR
+  popd >/dev/null # $ROOT_DIR/$KERNEL_DIR
 elif [ "${TRIM_NONLISTED_KMI}" = "1" ]; then
   echo "ERROR: TRIM_NONLISTED_KMI requires a KMI_SYMBOL_LIST" >&2
   exit 1
@@ -1045,7 +1045,7 @@ if [ -z "${SKIP_CP_KERNEL_HDR}" ] ; then
   echo "========================================================"
   KERNEL_HEADERS_TAR=${DIST_DIR}/kernel-headers.tar.gz
   echo " Copying kernel headers to ${KERNEL_HEADERS_TAR}"
-  pushd $ROOT_DIR/$KERNEL_DIR
+  pushd $ROOT_DIR/$KERNEL_DIR >/dev/null
     find arch include $OUT_DIR -name *.h -print0               \
             | tar -czf $KERNEL_HEADERS_TAR                     \
               --absolute-names                                 \
@@ -1053,7 +1053,7 @@ if [ -z "${SKIP_CP_KERNEL_HDR}" ] ; then
               --transform "s,.*$OUT_DIR,,"                     \
               --transform "s,^,kernel-headers/,"               \
               --null -T -
-  popd
+  popd >/dev/null
 fi
 
 if [ "${GENERATE_VMLINUX_BTF}" = "1" ]; then
