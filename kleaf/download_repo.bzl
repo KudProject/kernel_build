@@ -13,8 +13,8 @@
 # limitations under the License.
 # TODO(b/217630659): Move contents of _impl.bzl back to this file.
 load(
-    "//build/kernel/kleaf:common_kernels_impl.bzl",
-    define_common_kernels_impl = "define_common_kernels",
+    "//build/kernel/kleaf:download_repo_impl.bzl",
+    download_artifacts_repo_impl = "download_artifacts_repo",
 )
 
-define_common_kernels = define_common_kernels_impl
+download_artifacts_repo = download_artifacts_repo_impl

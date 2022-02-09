@@ -11,10 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# TODO(b/217630659): Move contents of _impl.bzl back to this file.
-load(
-    "//build/kernel/kleaf:common_kernels_impl.bzl",
-    define_common_kernels_impl = "define_common_kernels",
-)
+_common_outs = [
+    "System.map",
+    "modules.builtin",
+    "modules.builtin.modinfo",
+    "vmlinux",
+    "vmlinux.symvers",
+]
 
-define_common_kernels = define_common_kernels_impl
+# Common output files for aarch64 kernel builds.
+aarch64_outs = _common_outs + [
+    "Image",
+    "Image.lz4",
+]
+
+# Common output files for x86_64 kernel builds.
+x86_64_outs = _common_outs + ["bzImage"]
