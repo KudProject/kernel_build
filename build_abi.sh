@@ -64,6 +64,13 @@
 
 export ROOT_DIR=$($(dirname $(readlink -f $0))/gettop.sh)
 
+export STGDIFF_MESSAGE='
+WARNING:
+WARNING: Ignoring stgdiff exit status (%s)
+WARNING: see b/213141061
+WARNING:
+';
+
 function show_help {
     echo "USAGE: $0 [-u|--update] [-n|--nodiff]"
     echo
@@ -349,6 +356,9 @@ if [ -n "$ABI_DEFINITION" ]; then
         if [ $rc -ne 0 ]; then
             echo " stgdiff has reported ABI differences" 1>&2
         fi
+
+        printf -- "$STGDIFF_MESSAGE" "$rc";
+        rc=0
     fi
     if [ $UPDATE -eq 1 ] ; then
         echo "========================================================"
