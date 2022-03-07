@@ -13,8 +13,7 @@
 # limitations under the License.
 
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
-
-_KERNEL_BUILD_DEFAULT_TOOLCHAIN_VERSION = "r437112"
+load("@kernel_toolchain_info//:dict.bzl", "CLANG_VERSION")
 
 # Outputs of a kernel_build rule needed to build kernel_module's
 _kernel_build_internal_outs = [
@@ -137,7 +136,7 @@ def kernel_build(
     the build. The effective output file names will be
     `$(name)/$(output_file)`. Any other artifact is not guaranteed to be
     accessible after the rule has run. The default `toolchain_version` is defined
-    with a sensible default, but can be overriden.
+    with the value in `common/build.config.constants`, but can be overriden.
 
     A few additional labels are generated.
     For example, if name is `"kernel_aarch64"`:
@@ -401,12 +400,6 @@ def kernel_build(
         **kwargs
     )
 
-    labels_for_dist = [
-        name,
-        uapi_headers_target_name,
-        headers_target_name,
-    ]
-
     if generate_vmlinux_btf:
         vmlinux_btf_name = name + "_vmlinux_btf"
         _vmlinux_btf(
@@ -415,13 +408,6 @@ def kernel_build(
             env = env_target_name,
             **kwargs
         )
-        labels_for_dist.append(vmlinux_btf_name)
-
-    native.filegroup(
-        name = name + "_for_dist",
-        srcs = labels_for_dist,
-        **kwargs
-    )
 
 _DtsTreeInfo = provider(fields = {
     "srcs": "DTS tree sources",
@@ -534,8 +520,19 @@ def _kernel_env_impl(ctx):
         # error on failures
           set -e
           set -o pipefail
+    """
+
+    if ctx.attr._debug_annotate_scripts[BuildSettingInfo].value:
+        command += """
+          export MAKEFLAGS="${MAKEFLAGS} V=1"
+        """
+    else:
+        command += """
         # Run Make in silence mode to suppress most of the info output
-          export MAKEFLAGS="${{MAKEFLAGS}} -s"
+          export MAKEFLAGS="${MAKEFLAGS} -s"
+        """
+
+    command += """
         # Increase parallelism # TODO(b/192655643): do not use -j anymore
           export MAKEFLAGS="${{MAKEFLAGS}} -j$(nproc)"
         # create a build environment
@@ -623,6 +620,34 @@ def _get_tools(toolchain_version):
         )
     ]
 
+_KernelToolchainInfo = provider(fields = {
+    "toolchain_version": "The toolchain version",
+})
+
+def _kernel_toolchain_aspect_impl(target, ctx):
+    if ctx.rule.kind == "_kernel_build":
+        return ctx.rule.attr.config[_KernelToolchainInfo]
+    if ctx.rule.kind == "_kernel_config":
+        return ctx.rule.attr.env[_KernelToolchainInfo]
+    if ctx.rule.kind == "_kernel_env":
+        return _KernelToolchainInfo(toolchain_version = ctx.rule.attr.toolchain_version)
+    if ctx.rule.kind == "kernel_filegroup":
+        # TODO(b/213939521): Support _KernelToolchainInfo on prebuilts
+        return _KernelToolchainInfo()
+    fail("{label}: Unable to get toolchain info because {kind} is not supported.".format(
+        kind = ctx.rule.kind,
+        label = ctx.label,
+    ))
+
+_kernel_toolchain_aspect = aspect(
+    implementation = _kernel_toolchain_aspect_impl,
+    doc = "An aspect describing the toolchain of a `_kernel_build`, `_kernel_config`, or `_kernel_env` rule.",
+    attr_aspects = [
+        "config",
+        "env",
+    ],
+)
+
 _kernel_env = rule(
     implementation = _kernel_env_impl,
     doc = """Generates a rule that generates a source-able build environment.
@@ -663,7 +688,7 @@ _kernel_env = rule(
         ),
         "toolchain_version": attr.string(
             doc = "the toolchain to use for this environment",
-            default = _KERNEL_BUILD_DEFAULT_TOOLCHAIN_VERSION,
+            default = CLANG_VERSION,
         ),
         "kconfig_ext": attr.label(
             allow_single_file = True,
@@ -748,7 +773,7 @@ def _kernel_config_impl(ctx):
         # LTO configuration
         {lto_command}
         # Grab outputs
-          mv ${{OUT_DIR}}/.config {config}
+          cp -p ${{OUT_DIR}}/.config {config}
           tar czf {include_tar_gz} -C ${{OUT_DIR}} include/
         """.format(
         config = config.path,
@@ -768,7 +793,7 @@ def _kernel_config_impl(ctx):
     setup = ctx.attr.env[_KernelEnvInfo].setup + """
          # Restore kernel config inputs
            mkdir -p ${{OUT_DIR}}/include/
-           cp {config} ${{OUT_DIR}}/.config
+           rsync -p -L {config} ${{OUT_DIR}}/.config
            tar xf {include_tar_gz} -C ${{OUT_DIR}}
     """.format(config = config.path, include_tar_gz = include_tar_gz.path)
 
@@ -841,10 +866,42 @@ _kernel_build_aspect = aspect(
     ],
 )
 
+def _kernel_build_check_toolchain(ctx):
+    """
+    Check toolchain_version is the same as base_kernel.
+    """
+
+    this_toolchain = ctx.attr.config[_KernelToolchainInfo].toolchain_version
+    base_toolchain = _getoptattr(ctx.attr.base_kernel[_KernelToolchainInfo], "toolchain_version")
+
+    # TODO(b/213939521): Support _KernelToolchainInfo on kernel_filegroup and drop the None check
+    if base_toolchain == None:
+        return
+
+    if this_toolchain != base_toolchain:
+        fail("""{this_label}:
+
+ERROR: `toolchain_version` is "{this_toolchain}" for "{this_label}", but
+       `toolchain_version` is "{base_toolchain}" for "{base_kernel}" (`base_kernel`).
+       They must use the same `toolchain_version`.
+
+       Fix by setting `toolchain_version` of "{this_label}"
+       to be the one used by "{base_kernel}".
+       If "{base_kernel}" does not set `toolchain_version` explicitly, do not set
+       `toolchain_version` for "{this_label}" either.
+""".format(
+            this_label = ctx.label,
+            this_toolchain = this_toolchain,
+            base_kernel = ctx.attr.base_kernel.label,
+            base_toolchain = base_toolchain,
+        ))
+
 def _kernel_build_impl(ctx):
     kbuild_mixed_tree = None
     base_kernel_files = []
     if ctx.attr.base_kernel:
+        _kernel_build_check_toolchain(ctx)
+
         # Create a directory for KBUILD_MIXED_TREE. Flatten the directory structure of the files
         # that ctx.attr.base_kernel provides. declare_directory is sufficient because the directory should
         # only change when the dependent ctx.attr.base_kernel changes.
@@ -1035,6 +1092,7 @@ _kernel_build = rule(
         "config": attr.label(
             mandatory = True,
             providers = [_KernelEnvInfo],
+            aspects = [_kernel_toolchain_aspect],
             doc = "the kernel_config target",
         ),
         "srcs": attr.label_list(mandatory = True, doc = "kernel sources", allow_files = True),
@@ -1052,6 +1110,7 @@ _kernel_build = rule(
         ),
         "base_kernel": attr.label(
             providers = [KernelFilesInfo],
+            aspects = [_kernel_toolchain_aspect],
         ),
         "modules_prepare": attr.label(),
         "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
@@ -1107,6 +1166,7 @@ _KernelModuleInfo = provider(fields = {
     "kernel_build": "kernel_build attribute of this module",
     "modules_staging_archive": "Archive containing staging kernel modules. " +
                                "Contains the lib/modules/* suffix.",
+    "kernel_uapi_headers_archive": "Archive containing UAPI headers to use the module.",
 })
 
 def _check_kernel_build(kernel_modules, kernel_build, this_label):
@@ -1152,11 +1212,14 @@ def _kernel_module_impl(ctx):
 
     modules_staging_archive = ctx.actions.declare_file("{}/modules_staging_archive.tar.gz".format(ctx.attr.name))
     modules_staging_dir = modules_staging_archive.dirname + "/staging"
+    kernel_uapi_headers_archive = ctx.actions.declare_file("{}/kernel-uapi-headers.tar.gz".format(ctx.attr.name))
+    kernel_uapi_headers_dir = kernel_uapi_headers_archive.dirname + "/kernel-uapi-headers.tar.gz_staging"
     outdir = modules_staging_archive.dirname  # equivalent to declare_directory(ctx.attr.name)
 
-    # additional_outputs: [modules_staging_archive] + [basename(out) for out in outs]
+    # additional_outputs: archives + [basename(out) for out in outs]
     additional_outputs = [
         modules_staging_archive,
+        kernel_uapi_headers_archive,
     ]
 
     # Original `outs` attribute of `kernel_module` macro.
@@ -1186,8 +1249,11 @@ def _kernel_module_impl(ctx):
     command += modules_prepare[_KernelEnvInfo].setup
     command += """
              # create dirs for modules
-               mkdir -p {modules_staging_dir}
-    """.format(modules_staging_dir = modules_staging_dir)
+               mkdir -p {modules_staging_dir} {kernel_uapi_headers_dir}/usr
+    """.format(
+        modules_staging_dir = modules_staging_dir,
+        kernel_uapi_headers_dir = kernel_uapi_headers_dir,
+    )
     for kernel_module_dep in ctx.attr.kernel_module_deps:
         command += kernel_module_dep[_KernelEnvInfo].setup
 
@@ -1200,7 +1266,7 @@ def _kernel_module_impl(ctx):
                if [ "${{DO_NOT_STRIP_MODULES}}" != "1" ]; then
                  module_strip_flag="INSTALL_MOD_STRIP=1"
                fi
-               ext_mod_rel=$(python3 -c "import os.path; print(os.path.relpath('${{ROOT_DIR}}/{ext_mod}', '${{KERNEL_DIR}}'))")
+               ext_mod_rel=$(rel_path ${{ROOT_DIR}}/{ext_mod} ${{KERNEL_DIR}})
 
              # Actual kernel module build
                make -C {ext_mod} ${{TOOL_ARGS}} M=${{ext_mod_rel}} O=${{OUT_DIR}} KERNEL_SRC=${{ROOT_DIR}}/${{KERNEL_DIR}}
@@ -1209,6 +1275,8 @@ def _kernel_module_impl(ctx):
                    O=${{OUT_DIR}} KERNEL_SRC=${{ROOT_DIR}}/${{KERNEL_DIR}}     \
                    INSTALL_MOD_PATH=$(realpath {modules_staging_dir})          \
                    INSTALL_MOD_DIR=extra/{ext_mod}                             \
+                   KERNEL_UAPI_HEADERS_DIR=$(realpath {kernel_uapi_headers_dir}) \
+                   INSTALL_HDR_PATH=$(realpath {kernel_uapi_headers_dir}/usr)  \
                    ${{module_strip_flag}} modules_install
              # Archive modules_staging_dir
                (
@@ -1222,8 +1290,10 @@ def _kernel_module_impl(ctx):
                )
              # Move files into place
                {search_and_mv_output} --srcdir {modules_staging_dir}/lib/modules/*/extra/{ext_mod}/ --dstdir {outdir} {outs}
-             # Remove {modules_staging_dir} because they are not declared
-               rm -rf {modules_staging_dir}
+             # Create headers archive
+               tar czf {kernel_uapi_headers_archive} --directory={kernel_uapi_headers_dir} usr/
+             # Remove staging dirs because they are not declared
+               rm -rf {modules_staging_dir} {kernel_uapi_headers_dir}
              # Move Module.symvers
                mv ${{OUT_DIR}}/${{ext_mod_rel}}/Module.symvers {module_symvers}
                """.format(
@@ -1235,6 +1305,8 @@ def _kernel_module_impl(ctx):
         outdir = outdir,
         outs = " ".join(original_outs),
         modules_staging_outs = " ".join(modules_staging_outs),
+        kernel_uapi_headers_archive = kernel_uapi_headers_archive.path,
+        kernel_uapi_headers_dir = kernel_uapi_headers_dir,
     )
 
     _debug_print_scripts(ctx, command)
@@ -1250,7 +1322,10 @@ def _kernel_module_impl(ctx):
              # Use a new shell to avoid polluting variables
                (
              # Set variables
-               ext_mod_rel=$(python3 -c "import os.path; print(os.path.relpath('${{ROOT_DIR}}/{ext_mod}', '${{KERNEL_DIR}}'))")
+               # rel_path requires the existence of ${{ROOT_DIR}}/{ext_mod}, which may not be the case for
+               # _kernel_modules_install. Make that.
+               mkdir -p ${{ROOT_DIR}}/{ext_mod}
+               ext_mod_rel=$(rel_path ${{ROOT_DIR}}/{ext_mod} ${{KERNEL_DIR}})
              # Restore Modules.symvers
                mkdir -p ${{OUT_DIR}}/${{ext_mod_rel}}
                cp {module_symvers} ${{OUT_DIR}}/${{ext_mod_rel}}/Module.symvers
@@ -1272,6 +1347,7 @@ def _kernel_module_impl(ctx):
         _KernelModuleInfo(
             kernel_build = ctx.attr.kernel_build,
             modules_staging_archive = modules_staging_archive,
+            kernel_uapi_headers_archive = kernel_uapi_headers_archive,
         ),
     ]
 
@@ -1956,8 +2032,19 @@ def _system_dlkm_image_impl(ctx):
                create_modules_staging "${{MODULES_LIST}}" {modules_staging_dir} \
                  {system_dlkm_staging_dir} "${{MODULES_BLOCKLIST}}" "-e"
                modules_root_dir=$(ls {system_dlkm_staging_dir}/lib/modules/*)
+             # Re-sign the stripped modules using kernel build time key
+               for module in $(find {system_dlkm_staging_dir} -type f -name '*.ko'); do
+                   "${{OUT_DIR}}"/scripts/sign-file sha1 \
+                   "${{OUT_DIR}}"/certs/signing_key.pem \
+                   "${{OUT_DIR}}"/certs/signing_key.x509 "${{module}}"
+               done
              # Build system_dlkm.img with signed GKI modules
                mkfs.erofs -zlz4hc "{system_dlkm_img}" "{system_dlkm_staging_dir}"
+             # No need to sign the image as modules are signed; add hash footer
+               avbtool add_hash_footer \
+                   --partition_name system_dlkm \
+                   --partition_size $((64 << 20)) \
+                   --image "{system_dlkm_img}"
              # Archive system_dlkm_staging_dir
                tar czf {system_dlkm_staging_archive} -C {system_dlkm_staging_dir} .
              # Remove staging directories
@@ -1991,6 +2078,7 @@ When included in a `copy_to_dist_dir` rule, this rule copies the `system_dlkm.im
 def _vendor_dlkm_image_impl(ctx):
     vendor_dlkm_img = ctx.actions.declare_file("{}/vendor_dlkm.img".format(ctx.label.name))
     vendor_dlkm_modules_load = ctx.actions.declare_file("{}/vendor_dlkm.modules.load".format(ctx.label.name))
+    vendor_dlkm_modules_blocklist = ctx.actions.declare_file("{}/vendor_dlkm.modules.blocklist".format(ctx.label.name))
     modules_staging_dir = vendor_dlkm_img.dirname + "/staging"
     vendor_dlkm_staging_dir = modules_staging_dir + "/vendor_dlkm_staging"
     command = """
@@ -2006,6 +2094,11 @@ def _vendor_dlkm_image_impl(ctx):
             # Move output files into place
               mv "${{DIST_DIR}}/vendor_dlkm.img" {vendor_dlkm_img}
               mv "${{DIST_DIR}}/vendor_dlkm.modules.load" {vendor_dlkm_modules_load}
+              if [[ -f "${{DIST_DIR}}/vendor_dlkm.modules.blocklist" ]]; then
+                mv "${{DIST_DIR}}/vendor_dlkm.modules.blocklist" {vendor_dlkm_modules_blocklist}
+              else
+                : > {vendor_dlkm_modules_blocklist}
+              fi
             # Remove staging directories
               rm -rf {vendor_dlkm_staging_dir}
     """.format(
@@ -2014,12 +2107,13 @@ def _vendor_dlkm_image_impl(ctx):
         vendor_dlkm_staging_dir = vendor_dlkm_staging_dir,
         vendor_dlkm_img = vendor_dlkm_img.path,
         vendor_dlkm_modules_load = vendor_dlkm_modules_load.path,
+        vendor_dlkm_modules_blocklist = vendor_dlkm_modules_blocklist.path,
     )
 
     return _build_modules_image_impl_common(
         ctx = ctx,
         what = "vendor_dlkm",
-        outputs = [vendor_dlkm_img, vendor_dlkm_modules_load],
+        outputs = [vendor_dlkm_img, vendor_dlkm_modules_load, vendor_dlkm_modules_blocklist],
         build_command = command,
         modules_staging_dir = modules_staging_dir,
         additional_inputs = [ctx.file.vendor_boot_modules_load],
@@ -2237,6 +2331,12 @@ def kernel_images(
         build_system_dlkm: Whether to build system_dlkm.img an erofs image with GKI modules.
         build_vendor_dlkm: Whether to build `vendor_dlkm` image. It must be set if
           `VENDOR_DLKM_MODULES_LIST` is non-empty.
+
+          Note: at the time of writing (Jan 2022), unlike `build.sh`,
+          `vendor_dlkm.modules.blocklist` is **always** created
+          regardless of the value of `VENDOR_DLKM_MODULES_BLOCKLIST`.
+          If `build_vendor_dlkm()` in `build_utils.sh` does not generate
+          `vendor_dlkm.modules.blocklist`, an empty file is created.
         build_boot_images: Whether to build boot images. It must be set if either `BUILD_BOOT_IMG`
           or `BUILD_VENDOR_BOOT_IMG` is set.
 
@@ -2365,7 +2465,7 @@ This is similar to [`filegroup`](https://docs.bazel.build/versions/main/be/gener
 that gives a convenient name to a collection of targets, which can be referenced from other rules.
 
 In addition, this rule is conformed with [`KernelFilesInfo`](#kernelfilesinfo), so it can be used
-in the `base_build` attribute of a [`kernel_build`](#kernel_build).
+in the `base_kernel` attribute of a [`kernel_build`](#kernel_build).
 """,
     attrs = {
         "srcs": attr.label_list(
