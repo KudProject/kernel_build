@@ -64,6 +64,13 @@
 
 export ROOT_DIR=$($(dirname $(readlink -f $0))/gettop.sh)
 
+export STGDIFF_MESSAGE='
+WARNING:
+WARNING: Ignoring stgdiff exit status (%s)
+WARNING: see b/213141061
+WARNING:
+';
+
 function show_help {
     echo "USAGE: $0 [-u|--update] [-n|--nodiff]"
     echo
@@ -267,28 +274,20 @@ COMMON_OUT_DIR=$(readlink -m ${OUT_DIR:-${ROOT_DIR}/out/${BRANCH}})
 id=${ABI_OUT_TAG:-$(git -C $KERNEL_DIR describe --dirty --always)}
 abi_out_file=abi-${id}.xml
 full_abi_out_file=abi-full-${id}.xml
-# if we have two to do, do them in parallel
 ${ROOT_DIR}/build/abi/dump_abi                \
     --linux-tree ${ABI_LINUX_TREE}            \
     ${ABI_VMLINUX_PATH}                       \
-    --out-file ${DIST_DIR}/${abi_out_file}    \
-    $KMI_SYMBOL_LIST_FLAG &
-if [ -n "$KMI_SYMBOL_LIST_FLAG" ]; then
-  ${ROOT_DIR}/build/abi/dump_abi                \
-      --linux-tree ${ABI_LINUX_TREE}            \
-      ${ABI_VMLINUX_PATH}                       \
-      --out-file ${DIST_DIR}/${full_abi_out_file} &
-  wait -n
-  wait -n
+    --out-file ${DIST_DIR}/${full_abi_out_file}
+if [ "$KMI_SYMBOL_LIST_FLAG" ]; then
+  ${ROOT_DIR}/build/abi/filter_abi               \
+      --in-file ${DIST_DIR}/${full_abi_out_file} \
+      --out-file ${DIST_DIR}/${abi_out_file}     \
+      $KMI_SYMBOL_LIST_FLAG
 else
-  wait -n
-  cp ${DIST_DIR}/${abi_out_file} ${DIST_DIR}/${full_abi_out_file}
+  cp ${DIST_DIR}/${full_abi_out_file} ${DIST_DIR}/${abi_out_file}
 fi
 
 effective_kernel_dir=$(readlink -f ${ROOT_DIR}/${KERNEL_DIR})
-if [ -n "${LLVM}" ]; then
-  CC=clang
-fi
 for f in "$abi_out_file" "$full_abi_out_file"; do
   # sanitize the abi.xml by removing any occurrences of the kernel path
   # and also do that with any left over paths sneaking in
@@ -300,7 +299,6 @@ for f in "$abi_out_file" "$full_abi_out_file"; do
   echo "
 <!--
      libabigail: $(abidw --version)
-     built with: $CC: $($CC --version | head -n1)
 -->" >> ${DIST_DIR}/$f
 done
 
@@ -344,6 +342,24 @@ if [ -n "$ABI_DEFINITION" ]; then
             echo "========================================================" 1>&2
             cat ${abi_report}.short 1>&2
         fi
+
+        set +e
+        ${ROOT_DIR}/build/abi/diff_abi --abi-tool STG                         \
+                                       --baseline $KERNEL_DIR/$ABI_DEFINITION \
+                                       --new      ${DIST_DIR}/${abi_out_file} \
+                                       --report   ${abi_report}.stg           \
+                                       --short-report ${abi_report}.stg.short
+        rc=$?
+        set -e
+        echo "========================================================"
+        echo " stgdiff reports have been created at ${abi_report}.stg.*"
+
+        if [ $rc -ne 0 ]; then
+            echo " stgdiff has reported ABI differences" 1>&2
+        fi
+
+        printf -- "$STGDIFF_MESSAGE" "$rc";
+        rc=0
     fi
     if [ $UPDATE -eq 1 ] ; then
         echo "========================================================"

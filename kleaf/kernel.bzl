@@ -14,6 +14,7 @@
 
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load("@kernel_toolchain_info//:dict.bzl", "CLANG_VERSION")
+load(":constants.bzl", "TOOLCHAIN_VERSION_FILENAME")
 
 # Outputs of a kernel_build rule needed to build kernel_module's
 _kernel_build_internal_outs = [
@@ -25,10 +26,10 @@ def _debug_trap():
     return """set -x
               trap '>&2 /bin/date' DEBUG"""
 
-def _debug_print_scripts(ctx, command):
+def _debug_print_scripts(ctx, command, what = None):
     if ctx.attr._debug_print_scripts[BuildSettingInfo].value:
         print("""
-        # Script that runs %s:%s""" % (ctx.label, command))
+        # Script that runs %s%s:%s""" % (ctx.label, (" " + what if what else ""), command))
 
 def _reverse_dict(d):
     """Reverse a dictionary of {key: [value, ...]}
@@ -48,6 +49,33 @@ def _getoptattr(thing, attr, default_value = None):
         return getattr(thing, attr)
     return default_value
 
+def _find_file(name, files, what, required = False):
+    """Find a file named |name| in the list of |files|. Expect zero or one match."""
+    result = []
+    for file in files:
+        if file.basename == name:
+            result.append(file)
+    if len(result) > 1 or (not result and required):
+        fail("{what} contains {} file(s) named {name}, expected {expected_len}{files}".format(
+            what = what,
+            actual_len = len(result),
+            name = name,
+            expected_len = "1" if required else "0 or 1",
+            files = ":\n  " + ("\n  ".join(result)) if result else "",
+        ))
+    return result[0] if result else None
+
+def _filter_module_srcs(files):
+    """Create the list of `module_srcs` for a [`kernel_build`] or similar."""
+    return [
+        s
+        for s in files
+        if s.path.endswith(".h") or any([token in s.path for token in [
+            "Makefile",
+            "scripts/",
+        ]])
+    ]
+
 def _kernel_build_config_impl(ctx):
     out_file = ctx.actions.declare_file(ctx.attr.name + ".generated")
     command = "cat {srcs} > {out_file}".format(
@@ -56,6 +84,7 @@ def _kernel_build_config_impl(ctx):
     )
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelBuildConfig",
         inputs = ctx.files.srcs,
         outputs = [out_file],
         command = command,
@@ -87,7 +116,7 @@ kernel_build_config(
 
 """,
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -107,13 +136,6 @@ def _transform_kernel_build_outs(name, what, outs):
     else:
         fail("{}: Invalid type for {}: {}".format(name, what, type(outs)))
 
-KernelFilesInfo = provider(doc = """Contains information of files that a kernel build produces.
-
-In particular, this is required by the `base_kernel` attribute of a `kernel_build` rule.
-""", fields = {
-    "files": "A list of files that this kernel build provides.",
-})
-
 def kernel_build(
         name,
         build_config,
@@ -126,6 +148,9 @@ def kernel_build(
         base_kernel = None,
         kconfig_ext = None,
         dtstree = None,
+        kmi_symbol_lists = None,
+        trim_nonlisted_kmi = None,
+        kmi_symbol_list_strict_mode = None,
         toolchain_version = None,
         **kwargs):
     """Defines a kernel build target with all dependent targets.
@@ -161,26 +186,26 @@ def kernel_build(
           ```
         base_kernel: A label referring the base kernel build.
 
-          If set, the list of files specified in the `KernelFilesInfo` of the rule specified in
+          If set, the list of files specified in the `DefaultInfo` of the rule specified in
           `base_kernel` is copied to a directory, and `KBUILD_MIXED_TREE` is set to the directory.
           Setting `KBUILD_MIXED_TREE` effectively enables mixed build.
 
           To set additional flags for mixed build, change `build_config` to a `kernel_build_config`
           rule, with a build config fragment that contains the additional flags.
 
-          The label specified by `base_kernel` must conform to
-          [`KernelFilesInfo`](#kernelfilesinfo). Usually, this points to one of the following:
+          The label specified by `base_kernel` must produce a list of files similar
+          to what a `kernel_build` rule does. Usually, this points to one of the following:
           - `//common:kernel_{arch}`
           - A `kernel_filegroup` rule, e.g.
             ```
-            load("//build/kleaf:common_kernels.bzl, "aarch64_outs")
+            load("//build/kernel/kleaf:constants.bzl, "aarch64_outs")
             kernel_filegroup(
               name = "my_kernel_filegroup",
               srcs = aarch64_outs,
             )
             ```
 
-        generate_vmlinux_btf: If `True`, generates `vmlinux.btf` that is stripped off any debug
+        generate_vmlinux_btf: If `True`, generates `vmlinux.btf` that is stripped of any debug
           symbols, but contains type and symbol information within a .BTF section.
           This is suitable for ABI analysis through BTF.
 
@@ -292,6 +317,37 @@ def kernel_build(
         implicit_outs: Like `outs`, but not copied to the distribution directory.
 
           Labels are created for each item in `implicit_outs` as in `outs`.
+        kmi_symbol_lists: A list of labels referring to the KMI symbol list files.
+
+          If `kmi_symbol_lists` is a non-empty list, `abi_symbollist` and
+          `abi_symbollist.report` are created and added to the
+          [`DefaultInfo`](https://docs.bazel.build/versions/main/skylark/lib/DefaultInfo.html),
+          and copied to `DIST_DIR` during distribution.
+
+          If `kmi_symbol_lists` is `None` or an empty list, `abi_symbollist` and
+          `abi_symbollist.report` are not created.
+
+          This is the Bazel equivalent of `KMI_SYMBOL_LIST` and `ADDTIONAL_KMI_SYMBOL_LISTS`.
+
+          It is possible to use a `glob()` to determine whether `abi_symbollist`
+          and `abi_symbollist.report` should be generated at build time.
+          For example:
+          ```
+          kmi_symbol_lists = glob(["android/abi_gki_aarch64*"]),
+          ```
+        trim_nonlisted_kmi: If `True`, trim symbols not listed in
+          `kmi_symbol_lists`. This is the Bazel equivalent of
+          `TRIM_NONLISTED_KMI`.
+
+          Requires `kmi_symbol_lists` to be non-empty. If `kmi_symbol_lists`
+          is a `glob()`, it is possible to set `trim_nonlisted_kmi` to be a
+          value based on that `glob()`. For example:
+          ```
+          trim_nonlisted_kmi = len(glob(["android/abi_gki_aarch64*"])) > 0
+          ```
+        kmi_symbol_list_strict_mode: If `True`, add a build-time check between
+          the `kmi_symbol_lists` and the KMI resulting from the build, to ensure
+          they match 1-1.
         toolchain_version: The toolchain version to depend on.
         kwargs: Additional attributes to the internal rule, e.g.
           [`visibility`](https://docs.bazel.build/versions/main/visibility.html).
@@ -300,11 +356,15 @@ def kernel_build(
 
           These arguments applies on the target with `{name}`, `{name}_headers`, `{name}_uapi_headers`, and `{name}_vmlinux_btf`.
     """
+
     env_target_name = name + "_env"
     config_target_name = name + "_config"
     modules_prepare_target_name = name + "_modules_prepare"
     uapi_headers_target_name = name + "_uapi_headers"
     headers_target_name = name + "_headers"
+    kmi_symbol_list_target_name = name + "_kmi_symbol_list"
+    abi_symbollist_target_name = name + "_kmi_symbol_list_abi_symbollist"
+    raw_kmi_symbol_list_target_name = name + "_raw_kmi_symbol_list"
 
     if srcs == None:
         srcs = native.glob(
@@ -326,19 +386,39 @@ def kernel_build(
         toolchain_version = toolchain_version,
     )
 
+    _kmi_symbol_list(
+        name = kmi_symbol_list_target_name,
+        env = env_target_name,
+        srcs = kmi_symbol_lists,
+    )
+
+    native.filegroup(
+        name = abi_symbollist_target_name,
+        srcs = [kmi_symbol_list_target_name],
+        output_group = "abi_symbollist",
+    )
+
+    _raw_kmi_symbol_list(
+        name = raw_kmi_symbol_list_target_name,
+        env = env_target_name,
+        src = abi_symbollist_target_name,
+    )
+
     _kernel_config(
         name = config_target_name,
         env = env_target_name,
         srcs = srcs,
         config = config_target_name + "/.config",
         include_tar_gz = config_target_name + "/include.tar.gz",
+        trim_nonlisted_kmi = trim_nonlisted_kmi,
+        raw_kmi_symbol_list = raw_kmi_symbol_list_target_name if kmi_symbol_lists else None,
     )
 
     _modules_prepare(
         name = modules_prepare_target_name,
         config = config_target_name,
         srcs = srcs,
-        outdir_tar_gz = modules_prepare_target_name + "/outdir.tar.gz",
+        outdir_tar_gz = modules_prepare_target_name + "/modules_prepare_outdir.tar.gz",
     )
 
     _kernel_build(
@@ -352,6 +432,8 @@ def kernel_build(
         deps = deps,
         base_kernel = base_kernel,
         modules_prepare = modules_prepare_target_name,
+        kmi_symbol_list_strict_mode = kmi_symbol_list_strict_mode,
+        raw_kmi_symbol_list = raw_kmi_symbol_list_target_name if kmi_symbol_lists else None,
         **kwargs
     )
 
@@ -474,6 +556,12 @@ def kernel_dtstree(
     )
     _kernel_dtstree(**kwargs)
 
+def _get_stable_status_cmd(ctx, var):
+    return """$(cat {stable_status} | grep "{var}" | cut -f2 -d' ')""".format(
+        stable_status = ctx.info_file.path,
+        var = var,
+    )
+
 _KernelEnvInfo = provider(fields = {
     "dependencies": "dependencies required to use this environment setup",
     "setup": "setup script to initialize the environment",
@@ -535,6 +623,8 @@ def _kernel_env_impl(ctx):
     command += """
         # Increase parallelism # TODO(b/192655643): do not use -j anymore
           export MAKEFLAGS="${{MAKEFLAGS}} -j$(nproc)"
+        # Set the value of SOURCE_DATE_EPOCH
+          export SOURCE_DATE_EPOCH={source_date_epoch_cmd}
         # create a build environment
           source {build_utils_sh}
           export BUILD_CONFIG={build_config}
@@ -547,15 +637,18 @@ def _kernel_env_impl(ctx):
         setup_env = setup_env.path,
         preserve_env = preserve_env.path,
         out = out_file.path,
+        source_date_epoch_cmd = _get_stable_status_cmd(ctx, "STABLE_SOURCE_DATE_EPOCH"),
     )
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelEnv",
         inputs = srcs + [
             ctx.file._build_utils_sh,
             build_config,
             setup_env,
             preserve_env,
+            ctx.info_file,
         ],
         outputs = [out_file],
         progress_message = "Creating build environment for %s" % ctx.attr.name,
@@ -581,6 +674,20 @@ def _kernel_env_impl(ctx):
            export PATH=$PATH:$PWD/{host_tool_path}
          # setup LD_LIBRARY_PATH for prebuilts
            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$PWD/{linux_x86_libs_path}
+         # Set up scm version
+           (
+              # Save KLEAF_SCMVERSION to .scmversion if .scmversion does not already exist.
+              # If it does exist, then it is part of "srcs", so respect its value.
+              # If .git exists, we are not in sandbox. Let make calls setlocalversion.
+              if [[ ! -d ${{ROOT_DIR}}/${{KERNEL_DIR}}/.git ]] && [[ ! -f ${{ROOT_DIR}}/${{KERNEL_DIR}}/.scmversion ]]; then
+                KLEAF_SCMVERSION={scmversion_cmd}
+                if [[ ${{KLEAF_SCMVERSION}} ]]; then
+                    mkdir -p ${{ROOT_DIR}}/${{KERNEL_DIR}}
+                    echo $KLEAF_SCMVERSION > ${{ROOT_DIR}}/${{KERNEL_DIR}}/.scmversion
+                fi
+              fi
+           )
+         # Set up KCONFIG_EXT
            if [ -n "${{KCONFIG_EXT}}" ]; then
              export KCONFIG_EXT_PREFIX=$(rel_path $(realpath $(dirname ${{KCONFIG_EXT}})) ${{ROOT_DIR}}/${{KERNEL_DIR}})/
            fi
@@ -592,11 +699,13 @@ def _kernel_env_impl(ctx):
         host_tool_path = host_tool_path,
         build_utils_sh = ctx.file._build_utils_sh.path,
         linux_x86_libs_path = ctx.files._linux_x86_libs[0].dirname,
+        scmversion_cmd = _get_stable_status_cmd(ctx, "STABLE_SCMVERSION"),
     )
 
     dependencies += [
         out_file,
         ctx.file._build_utils_sh,
+        ctx.info_file,
     ]
     if kconfig_ext:
         dependencies.append(kconfig_ext)
@@ -613,7 +722,7 @@ def _get_tools(toolchain_version):
     return [
         Label(e)
         for e in (
-            "//build:kernel-build-scripts",
+            "//build/kernel:kernel-build-scripts",
             "//prebuilts/build-tools:linux-x86",
             "//prebuilts/kernel-build-tools:linux-x86",
             "//prebuilts/clang/host/linux-x86/clang-%s:binaries" % toolchain_version,
@@ -622,6 +731,7 @@ def _get_tools(toolchain_version):
 
 _KernelToolchainInfo = provider(fields = {
     "toolchain_version": "The toolchain version",
+    "toolchain_version_file": "A file containing the toolchain version",
 })
 
 def _kernel_toolchain_aspect_impl(target, ctx):
@@ -631,9 +741,17 @@ def _kernel_toolchain_aspect_impl(target, ctx):
         return ctx.rule.attr.env[_KernelToolchainInfo]
     if ctx.rule.kind == "_kernel_env":
         return _KernelToolchainInfo(toolchain_version = ctx.rule.attr.toolchain_version)
+
     if ctx.rule.kind == "kernel_filegroup":
-        # TODO(b/213939521): Support _KernelToolchainInfo on prebuilts
-        return _KernelToolchainInfo()
+        # Create a depset that contains all files referenced by "srcs"
+        all_srcs = depset([], transitive = [src.files for src in ctx.rule.attr.srcs])
+
+        # Traverse this depset and look for a file named "toolchain_version".
+        # If no file matches, leave it as None so that _kernel_build_check_toolchain prints a
+        # warning.
+        toolchain_version_file = _find_file(name = TOOLCHAIN_VERSION_FILENAME, files = all_srcs.to_list(), what = ctx.label)
+        return _KernelToolchainInfo(toolchain_version_file = toolchain_version_file)
+
     fail("{label}: Unable to get toolchain info because {kind} is not supported.".format(
         kind = ctx.rule.kind,
         label = ctx.label,
@@ -678,12 +796,12 @@ _kernel_env = rule(
         ),
         "setup_env": attr.label(
             allow_single_file = True,
-            default = Label("//build:_setup_env.sh"),
+            default = Label("//build/kernel:_setup_env.sh"),
             doc = "label referring to _setup_env.sh",
         ),
         "preserve_env": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:preserve_env.sh"),
+            default = Label("//build/kernel/kleaf:preserve_env.sh"),
             doc = "label referring to the script capturing the environment",
         ),
         "toolchain_version": attr.string(
@@ -699,15 +817,15 @@ _kernel_env = rule(
             doc = "Device tree",
         ),
         "_tools": attr.label_list(default = _get_tools),
-        "_host_tools": attr.label(default = "//build:host-tools"),
+        "_host_tools": attr.label(default = "//build/kernel:host-tools"),
         "_build_utils_sh": attr.label(
             allow_single_file = True,
-            default = Label("//build:build_utils.sh"),
+            default = Label("//build/kernel:build_utils.sh"),
         ),
         "_debug_annotate_scripts": attr.label(
-            default = "//build/kleaf:debug_annotate_scripts",
+            default = "//build/kernel/kleaf:debug_annotate_scripts",
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
         "_linux_x86_libs": attr.label(default = "//prebuilts/kernel-build-tools:linux-x86-libs"),
     },
 )
@@ -763,6 +881,26 @@ def _kernel_config_impl(ctx):
             for key, value in lto_config.items()
         ]))
 
+    if ctx.attr.trim_nonlisted_kmi and not ctx.file.raw_kmi_symbol_list:
+        fail("{}: trim_nonlisted_kmi is set but raw_kmi_symbol_list is empty.".format(ctx.label))
+
+    trim_kmi_command = ""
+    if ctx.attr.trim_nonlisted_kmi:
+        # We can't use an absolute path in CONFIG_UNUSED_KSYMS_WHITELIST.
+        # - ctx.file.raw_kmi_symbol_list is a relative path (e.g.
+        #   bazel-out/k8-fastbuild/bin/common/kernel_aarch64_raw_kmi_symbol_list/abi_symbollist.raw)
+        # - Canonicalizing the path gives an absolute path into the sandbox of
+        #   the _kernel_config rule. The sandbox is destroyed during the
+        #   execution of _kernel_build.
+        # Hence we use a relative path, the fixed value "abi_symbollist.raw".
+        trim_kmi_command = """
+            # Modify .config to trim symbols not listed in KMI
+              ${KERNEL_DIR}/scripts/config --file ${OUT_DIR}/.config \
+                  -d UNUSED_SYMBOLS -e TRIM_UNUSED_KSYMS \
+                  --set-str UNUSED_KSYMS_WHITELIST abi_symbollist.raw
+              make -C ${KERNEL_DIR} ${TOOL_ARGS} O=${OUT_DIR} olddefconfig
+        """
+
     command = ctx.attr.env[_KernelEnvInfo].setup + """
         # Pre-defconfig commands
           eval ${{PRE_DEFCONFIG_CMDS}}
@@ -772,6 +910,8 @@ def _kernel_config_impl(ctx):
           eval ${{POST_DEFCONFIG_CMDS}}
         # LTO configuration
         {lto_command}
+        # Trim nonlisted symbols
+          {trim_kmi_command}
         # Grab outputs
           cp -p ${{OUT_DIR}}/.config {config}
           tar czf {include_tar_gz} -C ${{OUT_DIR}} include/
@@ -779,10 +919,12 @@ def _kernel_config_impl(ctx):
         config = config.path,
         include_tar_gz = include_tar_gz.path,
         lto_command = lto_command,
+        trim_kmi_command = trim_kmi_command,
     )
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelConfig",
         inputs = srcs,
         outputs = [config, include_tar_gz],
         tools = ctx.attr.env[_KernelEnvInfo].dependencies,
@@ -790,17 +932,28 @@ def _kernel_config_impl(ctx):
         command = command,
     )
 
+    setup_deps = ctx.attr.env[_KernelEnvInfo].dependencies + \
+                 [config, include_tar_gz]
     setup = ctx.attr.env[_KernelEnvInfo].setup + """
          # Restore kernel config inputs
            mkdir -p ${{OUT_DIR}}/include/
            rsync -p -L {config} ${{OUT_DIR}}/.config
            tar xf {include_tar_gz} -C ${{OUT_DIR}}
     """.format(config = config.path, include_tar_gz = include_tar_gz.path)
+    if ctx.file.raw_kmi_symbol_list:
+        # When CONFIG_UNUSED_KSYMS_WHITELIST is a relative path, it is
+        # interpreted as a path relative to $abs_srctree, which is
+        # ${ROOT_DIR}/${KERNEL_DIR}. See common/scripts/gen_autoksyms.sh
+        setup_deps.append(ctx.file.raw_kmi_symbol_list)
+        setup += """
+            # Restore abi_symbollist.raw to abs_srctree
+              mkdir -p ${{ROOT_DIR}}/${{KERNEL_DIR}}
+              rsync -p -L {raw_kmi_symbol_list} ${{ROOT_DIR}}/${{KERNEL_DIR}}/abi_symbollist.raw
+        """.format(raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path)
 
     return [
         _KernelEnvInfo(
-            dependencies = ctx.attr.env[_KernelEnvInfo].dependencies +
-                           [config, include_tar_gz],
+            dependencies = setup_deps,
             setup = setup,
         ),
         DefaultInfo(files = depset([config, include_tar_gz])),
@@ -821,20 +974,141 @@ _kernel_config = rule(
             mandatory = True,
             doc = "the packaged include/ files",
         ),
-        "lto": attr.label(default = "//build/kleaf:lto"),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "lto": attr.label(default = "//build/kernel/kleaf:lto"),
+        "trim_nonlisted_kmi": attr.bool(doc = "If true, modify the config to trim non-listed symbols."),
+        "raw_kmi_symbol_list": attr.label(
+            doc = "Label to abi_symbollist.raw.",
+            allow_single_file = True,
+        ),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
+    },
+)
+
+def _kmi_symbol_list_impl(ctx):
+    if not ctx.files.srcs:
+        return
+
+    inputs = [] + ctx.files.srcs
+    inputs += ctx.attr.env[_KernelEnvInfo].dependencies
+    inputs += ctx.files._kernel_abi_scripts
+
+    outputs = []
+    out_file = ctx.actions.declare_file("{}/abi_symbollist".format(ctx.attr.name))
+    report_file = ctx.actions.declare_file("{}/abi_symbollist.report".format(ctx.attr.name))
+    outputs = [out_file, report_file]
+
+    command = ctx.attr.env[_KernelEnvInfo].setup + """
+        mkdir -p {out_dir}
+        {process_symbols} --out-dir={out_dir} --out-file={out_file_base} \
+            --report-file={report_file_base} --in-dir="${{ROOT_DIR}}/${{KERNEL_DIR}}" \
+            {srcs}
+    """.format(
+        process_symbols = ctx.file._process_symbols.path,
+        out_dir = out_file.dirname,
+        out_file_base = out_file.basename,
+        report_file_base = report_file.basename,
+        srcs = " ".join(["$(rel_path {} ${{ROOT_DIR}}/${{KERNEL_DIR}})".format(f.path) for f in ctx.files.srcs]),
+    )
+
+    _debug_print_scripts(ctx, command)
+    ctx.actions.run_shell(
+        mnemonic = "KmiSymbolList",
+        inputs = inputs,
+        outputs = outputs,
+        progress_message = "Creating abi_symbollist and report {}".format(ctx.label),
+        command = command,
+    )
+
+    return [
+        DefaultInfo(files = depset(outputs)),
+        OutputGroupInfo(abi_symbollist = depset([out_file])),
+    ]
+
+_kmi_symbol_list = rule(
+    implementation = _kmi_symbol_list_impl,
+    doc = "Build abi_symbollist if there are sources, otherwise don't build anything",
+    attrs = {
+        "env": attr.label(
+            mandatory = True,
+            providers = [_KernelEnvInfo],
+            doc = "environment target that defines the kernel build environment",
+        ),
+        "srcs": attr.label_list(
+            doc = "`KMI_SYMBOL_LIST` + `ADDTIONAL_KMI_SYMBOL_LISTS`",
+            allow_files = True,
+        ),
+        "_kernel_abi_scripts": attr.label(default = "//build/kernel:kernel-abi-scripts"),
+        "_process_symbols": attr.label(default = "//build/kernel:abi/process_symbols", allow_single_file = True),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
+    },
+)
+
+def _raw_kmi_symbol_list_impl(ctx):
+    if not ctx.file.src:
+        return
+
+    inputs = [ctx.file.src]
+    inputs += ctx.files._kernel_abi_scripts
+    inputs += ctx.attr.env[_KernelEnvInfo].dependencies
+
+    out_file = ctx.actions.declare_file("{}/abi_symbollist.raw".format(ctx.attr.name))
+
+    command = ctx.attr.env[_KernelEnvInfo].setup + """
+        mkdir -p {out_dir}
+        cat {src} | {flatten_symbol_list} > {out_file}
+    """.format(
+        out_dir = out_file.dirname,
+        flatten_symbol_list = ctx.file._flatten_symbol_list.path,
+        out_file = out_file.path,
+        src = ctx.file.src.path,
+    )
+
+    _debug_print_scripts(ctx, command)
+    ctx.actions.run_shell(
+        mnemonic = "RawKmiSymbolList",
+        inputs = inputs,
+        outputs = [out_file],
+        progress_message = "Creating abi_symbollist.raw {}".format(ctx.label),
+        command = command,
+    )
+
+    return DefaultInfo(files = depset([out_file]))
+
+_raw_kmi_symbol_list = rule(
+    implementation = _raw_kmi_symbol_list_impl,
+    doc = "Build `abi_symbollist.raw` if `src` refers to a file, otherwise don't build anything",
+    attrs = {
+        "env": attr.label(
+            mandatory = True,
+            providers = [_KernelEnvInfo],
+            doc = "environment target that defines the kernel build environment",
+        ),
+        "src": attr.label(
+            doc = "Label to `abi_symbollist`",
+            allow_single_file = True,
+        ),
+        "_kernel_abi_scripts": attr.label(default = "//build/kernel:kernel-abi-scripts"),
+        "_flatten_symbol_list": attr.label(default = "//build/kernel:abi/flatten_symbol_list", allow_single_file = True),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
 _KernelBuildInfo = provider(fields = {
-    "modules_staging_archive": "Archive containing staging kernel modules. " +
-                               "Does not contain the lib/modules/* suffix.",
-    "module_srcs": "sources for this kernel_build for building external modules",
     "out_dir_kernel_headers_tar": "Archive containing headers in `OUT_DIR`",
     "outs": "A list of File object corresponding to the `outs` attribute (excluding `module_outs`, `implicit_outs` and `internal_outs`)",
     "base_kernel_files": "[Default outputs](https://docs.bazel.build/versions/main/skylark/rules.html#default-outputs) of the rule specified by `base_kernel`",
     "interceptor_output": "`interceptor` log. See [`interceptor`](https://android.googlesource.com/kernel/tools/interceptor/) project.",
 })
+
+_KernelBuildExtModuleInfo = provider(
+    doc = "A provider that specifies the expectations of a `_kernel_module` (an external module) or a `kernel_modules_install` from its `kernel_build` attribute.",
+    fields = {
+        "modules_staging_archive": "Archive containing staging kernel modules. " +
+                                   "Does not contain the lib/modules/* suffix.",
+        "module_srcs": "sources for this kernel_build for building external modules",
+        "modules_prepare": "The `_modules_prepare` target.",
+    },
+)
 
 _SrcsInfo = provider(fields = {
     "srcs": "The srcs attribute of a rule.",
@@ -849,36 +1123,29 @@ _srcs_aspect = aspect(
     attr_aspects = ["srcs"],
 )
 
-_KernelBuildAspectInfo = provider(fields = {
-    "modules_prepare": "The *_modules_prepare target",
-})
-
-def _kernel_build_aspect_impl(target, ctx):
-    return [_KernelBuildAspectInfo(
-        modules_prepare = _getoptattr(ctx.rule.attr, "modules_prepare"),
-    )]
-
-_kernel_build_aspect = aspect(
-    implementation = _kernel_build_aspect_impl,
-    doc = "An aspect describing attributes of a _kernel_build rule.",
-    attr_aspects = [
-        "modules_prepare",
-    ],
-)
-
 def _kernel_build_check_toolchain(ctx):
     """
     Check toolchain_version is the same as base_kernel.
     """
 
+    base_kernel = ctx.attr.base_kernel
     this_toolchain = ctx.attr.config[_KernelToolchainInfo].toolchain_version
-    base_toolchain = _getoptattr(ctx.attr.base_kernel[_KernelToolchainInfo], "toolchain_version")
+    base_toolchain = _getoptattr(base_kernel[_KernelToolchainInfo], "toolchain_version")
+    base_toolchain_file = _getoptattr(base_kernel[_KernelToolchainInfo], "toolchain_version_file")
 
-    # TODO(b/213939521): Support _KernelToolchainInfo on kernel_filegroup and drop the None check
-    if base_toolchain == None:
+    if base_toolchain == None and base_toolchain_file == None:
+        print(("\nWARNING: {this_label}: No check is performed between the toolchain " +
+               "version of the base build ({base_kernel}) and the toolchain version of " +
+               "{this_name} ({this_toolchain}), because the toolchain version of {base_kernel} " +
+               "is unknown.").format(
+            this_label = ctx.label,
+            base_kernel = base_kernel.label,
+            this_name = ctx.label.name,
+            this_toolchain = this_toolchain,
+        ))
         return
 
-    if this_toolchain != base_toolchain:
+    if base_toolchain != None and this_toolchain != base_toolchain:
         fail("""{this_label}:
 
 ERROR: `toolchain_version` is "{this_toolchain}" for "{this_label}", but
@@ -892,21 +1159,114 @@ ERROR: `toolchain_version` is "{this_toolchain}" for "{this_label}", but
 """.format(
             this_label = ctx.label,
             this_toolchain = this_toolchain,
-            base_kernel = ctx.attr.base_kernel.label,
+            base_kernel = base_kernel.label,
             base_toolchain = base_toolchain,
         ))
+
+    if base_toolchain_file != None:
+        out = ctx.actions.declare_file("{}_toolchain_version/toolchain_version_checked")
+        base_toolchain = "$(cat {})".format(base_toolchain_file.path)
+        msg = """ERROR: toolchain_version is {this_toolchain} for {this_label}, but
+       toolchain_version is {base_toolchain} for {base_kernel} (base_kernel).
+       They must use the same toolchain_version.
+
+       Fix by setting toolchain_version of {this_label} to be {base_toolchain}.
+""".format(
+            this_label = ctx.label,
+            this_toolchain = this_toolchain,
+            base_kernel = base_kernel.label,
+            base_toolchain = base_toolchain,
+        )
+        command = """
+                # Check toolchain_version against base kernel
+                  if ! diff <(cat {base_toolchain_file}) <(echo "{this_toolchain}") > /dev/null; then
+                    echo "{msg}" >&2
+                    exit 1
+                  fi
+                  touch {out}
+        """.format(
+            base_toolchain_file = base_toolchain_file.path,
+            this_toolchain = this_toolchain,
+            msg = msg,
+            out = out.path,
+        )
+
+        ctx.actions.run_shell(
+            mnemonic = "KernelBuildCheckToolchain",
+            inputs = [base_toolchain_file],
+            outputs = [out],
+            command = command,
+            progress_message = "Checking toolchain version against base kernel {}".format(ctx.label),
+        )
+        return out
+
+def _kernel_build_dump_toolchain_version(ctx):
+    this_toolchain = ctx.attr.config[_KernelToolchainInfo].toolchain_version
+    out = ctx.actions.declare_file("{}_toolchain_version/{}".format(ctx.attr.name, TOOLCHAIN_VERSION_FILENAME))
+    ctx.actions.write(
+        output = out,
+        content = this_toolchain + "\n",
+    )
+    return out
+
+def _kmi_symbol_list_strict_mode(ctx, all_output_files):
+    """Run for `KMI_SYMBOL_LIST_STRICT_MODE`.
+    """
+    if not ctx.attr.kmi_symbol_list_strict_mode:
+        return None
+    if not ctx.file.raw_kmi_symbol_list:
+        fail("{}: kmi_symbol_list_strict_mode requires kmi_symbol_lists.")
+
+    vmlinux = all_output_files["outs"].get("vmlinux")
+    if not vmlinux:
+        fail("{}: with kmi_symbol_list_strict_mode, outs does not contain vmlinux")
+    module_symvers = all_output_files["internal_outs"].get("Module.symvers")
+    if not module_symvers:
+        fail("{}: with kmi_symbol_list_strict_mode, outs does not contain module_symvers")
+
+    modules = all_output_files["module_outs"].values()
+    objects = [f.basename for f in ([vmlinux] + modules)]
+
+    inputs = [
+        module_symvers,
+        ctx.file.raw_kmi_symbol_list,
+    ]
+    inputs += ctx.files._kernel_abi_scripts
+    inputs += ctx.attr.config[_KernelEnvInfo].dependencies
+
+    out = ctx.actions.declare_file("{}_kmi_strict_out/kmi_symbol_list_strict_mode_checked".format(ctx.attr.name))
+    command = ctx.attr.config[_KernelEnvInfo].setup + """
+        KMI_STRICT_MODE_OBJECTS="{objects}" {compare_to_symbol_list} {module_symvers} {raw_kmi_symbol_list}
+        touch {out}
+    """.format(
+        objects = " ".join(objects),
+        compare_to_symbol_list = ctx.file._compare_to_symbol_list.path,
+        module_symvers = module_symvers.path,
+        raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path,
+        out = out.path,
+    )
+    _debug_print_scripts(ctx, command, what = "kmi_symbol_list_strict_mode")
+    ctx.actions.run_shell(
+        mnemonic = "KernelBuildKmiSymbolListStrictMode",
+        inputs = inputs,
+        outputs = [out],
+        command = command,
+        progress_message = "Checking for kmi_symbol_list_strict_mode {}".format(ctx.label),
+    )
+    return out
 
 def _kernel_build_impl(ctx):
     kbuild_mixed_tree = None
     base_kernel_files = []
+    check_toolchain_out = None
     if ctx.attr.base_kernel:
-        _kernel_build_check_toolchain(ctx)
+        check_toolchain_out = _kernel_build_check_toolchain(ctx)
 
         # Create a directory for KBUILD_MIXED_TREE. Flatten the directory structure of the files
         # that ctx.attr.base_kernel provides. declare_directory is sufficient because the directory should
         # only change when the dependent ctx.attr.base_kernel changes.
         kbuild_mixed_tree = ctx.actions.declare_directory("{}_kbuild_mixed_tree".format(ctx.label.name))
-        base_kernel_files = ctx.attr.base_kernel[KernelFilesInfo].files
+        base_kernel_files = ctx.files.base_kernel
         kbuild_mixed_tree_command = """
           # Restore GKI artifacts for mixed build
             export KBUILD_MIXED_TREE=$(realpath {kbuild_mixed_tree})
@@ -920,6 +1280,7 @@ def _kernel_build_impl(ctx):
             kbuild_mixed_tree = kbuild_mixed_tree.path,
         )
         ctx.actions.run_shell(
+            mnemonic = "KernelBuildKbuildMixedTree",
             inputs = base_kernel_files,
             outputs = [kbuild_mixed_tree],
             progress_message = "Creating KBUILD_MIXED_TREE",
@@ -933,10 +1294,12 @@ def _kernel_build_impl(ctx):
     ]
     inputs += ctx.files.srcs
     inputs += ctx.files.deps
+    if check_toolchain_out:
+        inputs.append(check_toolchain_out)
     if kbuild_mixed_tree:
         inputs.append(kbuild_mixed_tree)
 
-    # kernel_build(name="kenrel", outs=["out"])
+    # kernel_build(name="kernel", outs=["out"])
     # => _kernel_build(name="kernel", outs=["kernel/out"], internal_outs=["kernel/Module.symvers", ...])
     # => all_output_names = ["foo", "Module.symvers", ...]
     #    all_output_files = {"out": {"foo": File(...)}, "internal_outs": {"Module.symvers": File(...)}, ...}
@@ -999,9 +1362,9 @@ def _kernel_build_impl(ctx):
          # Check if there are remaining *.ko files
            remaining_ko_files=$(find ${{OUT_DIR}} -type f -name '*.ko')
            if [[ ${{remaining_ko_files}} ]]; then
-             echo "ERROR: The following kernel modules are built but not copied. Add these lines to the module_outs attribute of {label}:"
+             echo "ERROR: The following kernel modules are built but not copied. Add these lines to the module_outs attribute of {label}:" >&2
              for ko in ${{remaining_ko_files}}; do
-               echo '    "'"$(basename ${{ko}})"'",'
+               echo '    "'"$(basename ${{ko}})"'",' >&2
              done
              exit 1
            fi
@@ -1024,12 +1387,16 @@ def _kernel_build_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelBuild",
         inputs = inputs,
         outputs = command_outputs,
         tools = ctx.attr.config[_KernelEnvInfo].dependencies,
         progress_message = "Building kernel %s" % ctx.attr.name,
         command = command,
     )
+
+    toolchain_version_out = _kernel_build_dump_toolchain_version(ctx)
+    kmi_strict_mode_out = _kmi_symbol_list_strict_mode(ctx, all_output_files)
 
     # Only outs and internal_outs are needed. But for simplicity, copy the full {ruledir}
     # which includes module_outs and implicit_outs too.
@@ -1051,38 +1418,39 @@ def _kernel_build_impl(ctx):
         setup = env_info_setup,
     )
 
-    module_srcs = [
-        s
-        for s in ctx.files.srcs
-        if s.path.endswith(".h") or any([token in s.path for token in [
-            "Makefile",
-            "scripts/",
-        ]])
-    ]
+    module_srcs = _filter_module_srcs(ctx.files.srcs)
+
     kernel_build_info = _KernelBuildInfo(
-        modules_staging_archive = modules_staging_archive,
-        module_srcs = module_srcs,
         out_dir_kernel_headers_tar = out_dir_kernel_headers_tar,
         outs = all_output_files["outs"].values(),
         base_kernel_files = base_kernel_files,
         interceptor_output = interceptor_output,
     )
 
+    kernel_build_module_info = _KernelBuildExtModuleInfo(
+        modules_staging_archive = modules_staging_archive,
+        module_srcs = module_srcs,
+        modules_prepare = ctx.attr.modules_prepare,
+    )
+
     output_group_kwargs = {}
     for d in all_output_files.values():
         output_group_kwargs.update({name: depset([file]) for name, file in d.items()})
+    output_group_kwargs["modules_staging_archive"] = depset([modules_staging_archive])
     output_group_info = OutputGroupInfo(**output_group_kwargs)
 
     default_info_files = all_output_files["outs"].values() + all_output_files["module_outs"].values()
+    default_info_files.append(toolchain_version_out)
+    if kmi_strict_mode_out:
+        default_info_files.append(kmi_strict_mode_out)
     default_info = DefaultInfo(files = depset(default_info_files))
-    kernel_files_info = KernelFilesInfo(files = default_info_files)
 
     return [
         env_info,
         kernel_build_info,
+        kernel_build_module_info,
         output_group_info,
         default_info,
-        kernel_files_info,
     ]
 
 _kernel_build = rule(
@@ -1102,18 +1470,24 @@ _kernel_build = rule(
         "implicit_outs": attr.string_list(doc = "Like `outs`, but not in dist"),
         "_search_and_mv_output": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:search_and_mv_output.py"),
+            default = Label("//build/kernel/kleaf:search_and_mv_output.py"),
             doc = "label referring to the script to process outputs",
         ),
         "deps": attr.label_list(
             allow_files = True,
         ),
         "base_kernel": attr.label(
-            providers = [KernelFilesInfo],
             aspects = [_kernel_toolchain_aspect],
         ),
         "modules_prepare": attr.label(),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "kmi_symbol_list_strict_mode": attr.bool(),
+        "raw_kmi_symbol_list": attr.label(
+            doc = "Label to abi_symbollist.raw.",
+            allow_single_file = True,
+        ),
+        "_kernel_abi_scripts": attr.label(default = "//build/kernel:kernel-abi-scripts"),
+        "_compare_to_symbol_list": attr.label(default = "//build/kernel:abi/compare_to_symbol_list", allow_single_file = True),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1127,6 +1501,7 @@ def _modules_prepare_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "ModulesPrepare",
         inputs = ctx.files.srcs,
         outputs = [ctx.outputs.outdir_tar_gz],
         tools = ctx.attr.config[_KernelEnvInfo].dependencies,
@@ -1136,7 +1511,7 @@ def _modules_prepare_impl(ctx):
 
     setup = """
          # Restore modules_prepare outputs. Assumes env setup.
-           [ -z ${{OUT_DIR}} ] && echo "modules_prepare setup run without OUT_DIR set!" && exit 1
+           [ -z ${{OUT_DIR}} ] && echo "ERROR: modules_prepare setup run without OUT_DIR set!" >&2 && exit 1
            tar xf {outdir_tar_gz} -C ${{OUT_DIR}}
            """.format(outdir_tar_gz = ctx.outputs.outdir_tar_gz.path)
 
@@ -1158,7 +1533,7 @@ _modules_prepare = rule(
             mandatory = True,
             doc = "the packaged ${OUT_DIR} files",
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1197,12 +1572,12 @@ def _check_kernel_build(kernel_modules, kernel_build, this_label):
 def _kernel_module_impl(ctx):
     _check_kernel_build(ctx.attr.kernel_module_deps, ctx.attr.kernel_build, ctx.label)
 
-    modules_prepare = ctx.attr.kernel_build[_KernelBuildAspectInfo].modules_prepare
+    modules_prepare = ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare
     inputs = []
     inputs += ctx.files.srcs
     inputs += ctx.attr.kernel_build[_KernelEnvInfo].dependencies
     inputs += modules_prepare[_KernelEnvInfo].dependencies
-    inputs += ctx.attr.kernel_build[_KernelBuildInfo].module_srcs
+    inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].module_srcs
     inputs += ctx.files.makefile
     inputs += [
         ctx.file._search_and_mv_output,
@@ -1311,6 +1686,7 @@ def _kernel_module_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelModule",
         inputs = inputs,
         outputs = ctx.outputs.outs + additional_outputs +
                   additional_declared_outputs,
@@ -1365,8 +1741,7 @@ _kernel_module = rule(
         ),
         "kernel_build": attr.label(
             mandatory = True,
-            providers = [_KernelEnvInfo, _KernelBuildInfo],
-            aspects = [_kernel_build_aspect],
+            providers = [_KernelEnvInfo, _KernelBuildExtModuleInfo],
         ),
         "kernel_module_deps": attr.label_list(
             providers = [_KernelEnvInfo, _KernelModuleInfo],
@@ -1377,10 +1752,10 @@ _kernel_module = rule(
         "outs": attr.output_list(),
         "_search_and_mv_output": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:search_and_mv_output.py"),
+            default = Label("//build/kernel/kleaf:search_and_mv_output.py"),
             doc = "Label referring to the script to process outputs",
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1523,7 +1898,7 @@ def _kernel_module_set_defaults(kwargs):
 def _kernel_modules_install_impl(ctx):
     _check_kernel_build(ctx.attr.kernel_modules, ctx.attr.kernel_build, ctx.label)
 
-    modules_prepare = ctx.attr.kernel_build[_KernelBuildAspectInfo].modules_prepare
+    modules_prepare = ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare
 
     # A list of declared files for outputs of kernel_module rules
     external_modules = []
@@ -1531,11 +1906,11 @@ def _kernel_modules_install_impl(ctx):
     inputs = []
     inputs += ctx.attr.kernel_build[_KernelEnvInfo].dependencies
     inputs += modules_prepare[_KernelEnvInfo].dependencies
-    inputs += ctx.attr.kernel_build[_KernelBuildInfo].module_srcs
+    inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].module_srcs
     inputs += [
         ctx.file._search_and_mv_output,
         ctx.file._check_duplicated_files_in_archives,
-        ctx.attr.kernel_build[_KernelBuildInfo].modules_staging_archive,
+        ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_staging_archive,
     ]
     for kernel_module in ctx.attr.kernel_modules:
         inputs += kernel_module[_KernelEnvInfo].dependencies
@@ -1564,7 +1939,7 @@ def _kernel_modules_install_impl(ctx):
     """.format(
         modules_staging_dir = modules_staging_dir,
         kernel_build_modules_staging_archive =
-            ctx.attr.kernel_build[_KernelBuildInfo].modules_staging_archive.path,
+            ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_staging_archive.path,
     )
     for kernel_module in ctx.attr.kernel_modules:
         command += kernel_module[_KernelEnvInfo].setup
@@ -1585,7 +1960,7 @@ def _kernel_modules_install_impl(ctx):
                {check_duplicated_files_in_archives} ${{modules_staging_archives}}
              # Set variables
                if [[ ! -f ${{OUT_DIR}}/include/config/kernel.release ]]; then
-                   echo "No ${{OUT_DIR}}/include/config/kernel.release"
+                   echo "ERROR: No ${{OUT_DIR}}/include/config/kernel.release" >&2
                    exit 1
                fi
                kernelrelease=$(cat ${{OUT_DIR}}/include/config/kernel.release 2> /dev/null)
@@ -1621,6 +1996,7 @@ def _kernel_modules_install_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelModulesInstall",
         inputs = inputs,
         outputs = external_modules + [
             modules_staging_archive,
@@ -1676,19 +2052,18 @@ In `foo_dist`, specifying `foo_modules_install` in `data` won't include
             doc = "A list of labels referring to `kernel_module`s to install. Must have the same `kernel_build` as this rule.",
         ),
         "kernel_build": attr.label(
-            providers = [_KernelEnvInfo, _KernelBuildInfo],
+            providers = [_KernelEnvInfo, _KernelBuildExtModuleInfo],
             doc = "Label referring to the `kernel_build` module.",
-            aspects = [_kernel_build_aspect],
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
         "_check_duplicated_files_in_archives": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:check_duplicated_files_in_archives.py"),
+            default = Label("//build/kernel/kleaf:check_duplicated_files_in_archives.py"),
             doc = "Label referring to the script to process outputs",
         ),
         "_search_and_mv_output": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:search_and_mv_output.py"),
+            default = Label("//build/kernel/kleaf:search_and_mv_output.py"),
             doc = "Label referring to the script to process outputs",
         ),
     },
@@ -1711,6 +2086,7 @@ def _kernel_uapi_headers_impl(ctx):
     )
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelUapiHeaders",
         inputs = ctx.files.srcs + ctx.attr.config[_KernelEnvInfo].dependencies,
         outputs = [out_file],
         progress_message = "Building UAPI kernel headers %s" % ctx.attr.name,
@@ -1725,13 +2101,13 @@ _kernel_uapi_headers = rule(
     implementation = _kernel_uapi_headers_impl,
     doc = """Build kernel-uapi-headers.tar.gz""",
     attrs = {
-        "srcs": attr.label_list(),
+        "srcs": attr.label_list(allow_files = True),
         "config": attr.label(
             mandatory = True,
             providers = [_KernelEnvInfo],
             doc = "the kernel_config target",
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1766,6 +2142,7 @@ def _kernel_headers_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "KernelHeaders",
         inputs = inputs,
         outputs = [out_file],
         progress_message = "Building kernel headers %s" % ctx.attr.name,
@@ -1780,7 +2157,7 @@ _kernel_headers = rule(
     implementation = _kernel_headers_impl,
     doc = "Build kernel-headers.tar.gz",
     attrs = {
-        "srcs": attr.label_list(),
+        "srcs": attr.label_list(allow_files = True),
         "kernel_build": attr.label(
             mandatory = True,
             providers = [_KernelBuildInfo],  # for out_dir_kernel_headers_tar only
@@ -1789,7 +2166,7 @@ _kernel_headers = rule(
             mandatory = True,
             providers = [_KernelEnvInfo],
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1813,6 +2190,7 @@ def _vmlinux_btf_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "VmlinuxBtf",
         inputs = inputs,
         outputs = [out_file],
         progress_message = "Building vmlinux.btf {}".format(ctx.label),
@@ -1832,7 +2210,7 @@ _vmlinux_btf = rule(
             mandatory = True,
             providers = [_KernelEnvInfo],
         ),
-        "_debug_print_scripts": attr.label(default = "//build/kleaf:debug_print_scripts"),
+        "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
 
@@ -1843,7 +2221,8 @@ def _build_modules_image_impl_common(
         build_command,
         modules_staging_dir,
         implicit_outputs = None,
-        additional_inputs = None):
+        additional_inputs = None,
+        mnemonic = None):
     """Command implementation for building images that directly contain modules.
 
     Args:
@@ -1857,22 +2236,12 @@ def _build_modules_image_impl_common(
     """
     kernel_build = ctx.attr.kernel_modules_install[_KernelModuleInfo].kernel_build
     kernel_build_outs = kernel_build[_KernelBuildInfo].outs + kernel_build[_KernelBuildInfo].base_kernel_files
-    system_map = None
-    for kernel_build_out in kernel_build_outs:
-        if kernel_build_out.basename == "System.map":
-            if system_map != None:
-                fail("{}: dependent kernel_build {} has multiple System.map in outs:\n  {}\n  {}".format(
-                    ctx.label,
-                    kernel_build,
-                    system_map.path,
-                    kernel_build_out.path,
-                ))
-            system_map = kernel_build_out
-    if system_map == None:
-        fail("{}: dependent kernel_build {} has no System.map in outs".format(
-            ctx.label,
-            kernel_build,
-        ))
+    system_map = _find_file(
+        name = "System.map",
+        files = kernel_build_outs,
+        required = True,
+        what = "{}: outs of dependent kernel_build {}".format(ctx.label, kernel_build),
+    )
     modules_staging_archive = ctx.attr.kernel_modules_install[_KernelModuleInfo].modules_staging_archive
 
     inputs = []
@@ -1915,6 +2284,7 @@ def _build_modules_image_impl_common(
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = mnemonic,
         inputs = inputs,
         outputs = command_outputs,
         progress_message = "Building {} {}".format(what, ctx.label),
@@ -1933,7 +2303,7 @@ def _build_modules_image_attrs_common(additional = None):
             allow_files = True,
         ),
         "_debug_print_scripts": attr.label(
-            default = "//build/kleaf:debug_print_scripts",
+            default = "//build/kernel/kleaf:debug_print_scripts",
         ),
     }
     if additional != None:
@@ -1993,6 +2363,7 @@ def _initramfs_impl(ctx):
         implicit_outputs = [
             initramfs_staging_archive,
         ],
+        mnemonic = "Initramfs",
     )
     return [
         default_info,
@@ -2062,6 +2433,7 @@ def _system_dlkm_image_impl(ctx):
         outputs = [system_dlkm_img, system_dlkm_staging_archive],
         build_command = command,
         modules_staging_dir = modules_staging_dir,
+        mnemonic = "SystemDlkmImage",
     )
     return [default_info]
 
@@ -2117,6 +2489,7 @@ def _vendor_dlkm_image_impl(ctx):
         build_command = command,
         modules_staging_dir = modules_staging_dir,
         additional_inputs = [ctx.file.vendor_boot_modules_load],
+        mnemonic = "VendorDlkmImage",
     )
 
 _vendor_dlkm_image = rule(
@@ -2195,6 +2568,7 @@ def _boot_images_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "BootImages",
         inputs = inputs,
         outputs = ctx.outputs.outs + [outdir],
         progress_message = "Building boot images {}".format(ctx.label),
@@ -2223,11 +2597,11 @@ Execute `build_boot_images` in `build_utils.sh`.""",
             default = "//tools/mkbootimg:mkbootimg.py",
         ),
         "_debug_print_scripts": attr.label(
-            default = "//build/kleaf:debug_print_scripts",
+            default = "//build/kernel/kleaf:debug_print_scripts",
         ),
         "_search_and_mv_output": attr.label(
             allow_single_file = True,
-            default = Label("//build/kleaf:search_and_mv_output.py"),
+            default = Label("//build/kernel/kleaf:search_and_mv_output.py"),
         ),
     },
 )
@@ -2250,6 +2624,7 @@ def _dtbo_impl(ctx):
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
+        mnemonic = "Dtbo",
         inputs = inputs,
         outputs = [output],
         progress_message = "Building dtbo {}".format(ctx.label),
@@ -2269,7 +2644,7 @@ _dtbo = rule(
             allow_files = True,
         ),
         "_debug_print_scripts": attr.label(
-            default = "//build/kleaf:debug_print_scripts",
+            default = "//build/kernel/kleaf:debug_print_scripts",
         ),
     },
 )
@@ -2452,9 +2827,18 @@ def kernel_images(
     )
 
 def _kernel_filegroup_impl(ctx):
+    all_deps = ctx.files.srcs + ctx.files.deps
+    kernel_module_dev_info = _KernelBuildExtModuleInfo(
+        modules_staging_archive = _find_file("modules_staging_dir.tar.gz", all_deps, what = ctx.label),
+        # TODO(b/219112010): implement _KernelEnvInfo for the modules_prepare target
+        modules_prepare = _find_file("modules_prepare_outdir.tar.gz", all_deps, what = ctx.label),
+        # TODO(b/211515836): module_srcs might also be downloaded
+        module_srcs = _filter_module_srcs(ctx.files.kernel_srcs),
+    )
     return [
         DefaultInfo(files = depset(ctx.files.srcs)),
-        KernelFilesInfo(files = ctx.files.srcs),
+        kernel_module_dev_info,
+        # TODO(b/219112010): implement _KernelEnvInfo for _kernel_build
     ]
 
 kernel_filegroup = rule(
@@ -2464,13 +2848,34 @@ kernel_filegroup = rule(
 This is similar to [`filegroup`](https://docs.bazel.build/versions/main/be/general.html#filegroup)
 that gives a convenient name to a collection of targets, which can be referenced from other rules.
 
-In addition, this rule is conformed with [`KernelFilesInfo`](#kernelfilesinfo), so it can be used
-in the `base_kernel` attribute of a [`kernel_build`](#kernel_build).
+It can be used in the `base_kernel` attribute of a [`kernel_build`](#kernel_build).
 """,
     attrs = {
         "srcs": attr.label_list(
             allow_files = True,
-            doc = "The list of labels that are members of this file group.",
+            doc = """The list of labels that are members of this file group.
+
+This usually contains a list of prebuilts, e.g. `vmlinux`, `Image.lz4`, `kernel-headers.tar.gz`,
+etc.
+
+Not to be confused with [`kernel_srcs`](#kernel_filegroup-kernel_srcs).""",
+        ),
+        "deps": attr.label_list(
+            allow_files = True,
+            doc = """A list of additional labels that participates in implementing the providers.
+
+This usually contains a list of prebuilts.
+
+Unlike srcs, these labels are NOT added to the [`DefaultInfo`](https://docs.bazel.build/versions/main/skylark/lib/DefaultInfo.html)""",
+        ),
+        "kernel_srcs": attr.label_list(
+            allow_files = True,
+            doc = """A list of files that would have been listed as `srcs` if this rule were a [`kernel_build`](#kernel_build).
+
+This is usually a `glob()` of source files.
+
+Not to be confused with [`srcs`](#kernel_filegroup-srcs).
+""",
         ),
     },
 )
@@ -2489,6 +2894,7 @@ def _kernel_compile_commands_impl(ctx):
         compile_commands = compile_commands.path,
     )
     ctx.actions.run_shell(
+        mnemonic = "KernelCompileCommands",
         inputs = inputs,
         outputs = [compile_commands],
         command = command,
@@ -2549,6 +2955,7 @@ def _kernel_kythe_impl(ctx):
         runextractor_error = runextractor_error.path,
     )
     ctx.actions.run_shell(
+        mnemonic = "KernelKythe",
         inputs = depset(inputs, transitive = transitive_inputs),
         outputs = [all_kzip, runextractor_error],
         command = command,
