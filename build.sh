@@ -281,7 +281,8 @@
 #
 #   BUILD_SYSTEM_DLKM
 #     if set to "1", build a system_dlkm.img containing all signed GKI modules
-#     and resulting depmod artifacts
+#     and resulting depmod artifacts. GKI build exclusive; DO NOT USE with device
+#     build configs files.
 #
 #   MODULES_OPTIONS
 #     A /lib/modules/modules.options file is created on the ramdisk containing
@@ -844,7 +845,7 @@ if [ "${BUILD_GKI_CERTIFICATION_TOOLS}" = "1"  ]; then
   GKI_CERTIFICATION_TOOLS_TAR="gki_certification_tools.tar.gz"
   echo "========================================================"
   echo " Generating ${GKI_CERTIFICATION_TOOLS_TAR}"
-  GKI_CERTIFICATION_BINARIES=(avbtool certify_bootimg)
+  GKI_CERTIFICATION_BINARIES=(avbtool certify_bootimg unpack_bootimg)
   GKI_CERTIFICATION_TOOLS_ROOT="${ROOT_DIR}/prebuilts/kernel-build-tools/linux-x86"
   GKI_CERTIFICATION_FILES="${GKI_CERTIFICATION_BINARIES[@]/#/bin/}"
   tar -czf ${DIST_DIR}/${GKI_CERTIFICATION_TOOLS_TAR} \
