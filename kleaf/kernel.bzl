@@ -890,7 +890,7 @@ _kernel_env = rule(
 )
 
 def _kernel_config_impl(ctx):
-    srcs = [
+    inputs = [
         s
         for s in ctx.files.srcs
         if any([token in s.path for token in [
@@ -951,14 +951,21 @@ def _kernel_config_impl(ctx):
         # - Canonicalizing the path gives an absolute path into the sandbox of
         #   the _kernel_config rule. The sandbox is destroyed during the
         #   execution of _kernel_build.
-        # Hence we use a relative path, the fixed value "abi_symbollist.raw".
+        # Hence we use a relative path. In this case, it is
+        # interpreted as a path relative to $abs_srctree, which is
+        # ${ROOT_DIR}/${KERNEL_DIR}. See common/scripts/gen_autoksyms.sh.
+        # Hence we set CONFIG_UNUSED_KSYMS_WHITELIST to the path of abi_symobllist.raw
+        # relative to ${KERNEL_DIR}.
         trim_kmi_command = """
             # Modify .config to trim symbols not listed in KMI
-              ${KERNEL_DIR}/scripts/config --file ${OUT_DIR}/.config \
+              ${{KERNEL_DIR}}/scripts/config --file ${{OUT_DIR}}/.config \
                   -d UNUSED_SYMBOLS -e TRIM_UNUSED_KSYMS \
-                  --set-str UNUSED_KSYMS_WHITELIST abi_symbollist.raw
-              make -C ${KERNEL_DIR} ${TOOL_ARGS} O=${OUT_DIR} olddefconfig
-        """
+                  --set-str UNUSED_KSYMS_WHITELIST $(rel_path {raw_kmi_symbol_list} ${{KERNEL_DIR}})
+              make -C ${{KERNEL_DIR}} ${{TOOL_ARGS}} O=${{OUT_DIR}} olddefconfig
+        """.format(raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path)
+
+        # rel_path requires the file to exist.
+        inputs.append(ctx.file.raw_kmi_symbol_list)
 
     command = ctx.attr.env[_KernelEnvInfo].setup + """
         # Pre-defconfig commands
@@ -986,7 +993,7 @@ def _kernel_config_impl(ctx):
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
         mnemonic = "KernelConfig",
-        inputs = srcs,
+        inputs = inputs,
         outputs = [config, include_dir],
         tools = ctx.attr.env[_KernelEnvInfo].dependencies,
         progress_message = "Creating kernel config %s" % ctx.attr.name,
@@ -1003,15 +1010,7 @@ def _kernel_config_impl(ctx):
            find ${{OUT_DIR}}/include -type d -exec chmod +w {{}} \\;
     """.format(config = config.path, include_dir = include_dir.path)
     if ctx.file.raw_kmi_symbol_list:
-        # When CONFIG_UNUSED_KSYMS_WHITELIST is a relative path, it is
-        # interpreted as a path relative to $abs_srctree, which is
-        # ${ROOT_DIR}/${KERNEL_DIR}. See common/scripts/gen_autoksyms.sh
         setup_deps.append(ctx.file.raw_kmi_symbol_list)
-        setup += """
-            # Restore abi_symbollist.raw to abs_srctree
-              mkdir -p ${{ROOT_DIR}}/${{KERNEL_DIR}}
-              rsync -aL {raw_kmi_symbol_list} ${{ROOT_DIR}}/${{KERNEL_DIR}}/abi_symbollist.raw
-        """.format(raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path)
 
     return [
         _KernelEnvInfo(
@@ -1164,7 +1163,8 @@ _KernelBuildExtModuleInfo = provider(
         "modules_staging_archive": "Archive containing staging kernel modules. " +
                                    "Does not contain the lib/modules/* suffix.",
         "module_srcs": "sources for this kernel_build for building external modules",
-        "modules_prepare": "The `_modules_prepare` target.",
+        "modules_prepare_setup": "A command that is equivalent to running `make modules_prepare`. Requires env setup.",
+        "modules_prepare_deps": "A list of deps to run `modules_prepare_cmd`.",
         "collect_unstripped_modules": "Whether an external [`kernel_module`](#kernel_module) building against this [`kernel_build`](#kernel_build) should provide unstripped ones for debugging.",
     },
 )
@@ -1551,7 +1551,8 @@ def _kernel_build_impl(ctx):
     kernel_build_module_info = _KernelBuildExtModuleInfo(
         modules_staging_archive = modules_staging_archive,
         module_srcs = module_srcs,
-        modules_prepare = ctx.attr.modules_prepare,
+        modules_prepare_setup = ctx.attr.modules_prepare[_KernelEnvInfo].setup,
+        modules_prepare_deps = ctx.attr.modules_prepare[_KernelEnvInfo].dependencies,
         collect_unstripped_modules = ctx.attr.collect_unstripped_modules,
     )
 
@@ -1713,11 +1714,10 @@ def _check_kernel_build(kernel_modules, kernel_build, this_label):
 def _kernel_module_impl(ctx):
     _check_kernel_build(ctx.attr.kernel_module_deps, ctx.attr.kernel_build, ctx.label)
 
-    modules_prepare = ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare
     inputs = []
     inputs += ctx.files.srcs
     inputs += ctx.attr.kernel_build[_KernelEnvInfo].dependencies
-    inputs += modules_prepare[_KernelEnvInfo].dependencies
+    inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare_deps
     inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].module_srcs
     inputs += ctx.files.makefile
     inputs += [
@@ -1771,8 +1771,9 @@ def _kernel_module_impl(ctx):
         module_symvers,
     ]
 
-    command = ctx.attr.kernel_build[_KernelEnvInfo].setup
-    command += modules_prepare[_KernelEnvInfo].setup
+    command = ""
+    command += ctx.attr.kernel_build[_KernelEnvInfo].setup
+    command += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare_setup
     command += """
              # create dirs for modules
                mkdir -p {modules_staging_dir} {kernel_uapi_headers_dir}/usr
@@ -2064,14 +2065,12 @@ def _kernel_module_set_defaults(kwargs):
 def _kernel_modules_install_impl(ctx):
     _check_kernel_build(ctx.attr.kernel_modules, ctx.attr.kernel_build, ctx.label)
 
-    modules_prepare = ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare
-
     # A list of declared files for outputs of kernel_module rules
     external_modules = []
 
     inputs = []
     inputs += ctx.attr.kernel_build[_KernelEnvInfo].dependencies
-    inputs += modules_prepare[_KernelEnvInfo].dependencies
+    inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare_deps
     inputs += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].module_srcs
     inputs += [
         ctx.file._search_and_mv_output,
@@ -2095,7 +2094,7 @@ def _kernel_modules_install_impl(ctx):
 
     command = ""
     command += ctx.attr.kernel_build[_KernelEnvInfo].setup
-    command += modules_prepare[_KernelEnvInfo].setup
+    command += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare_setup
     command += """
              # create dirs for modules
                mkdir -p {modules_staging_dir}
@@ -3214,10 +3213,20 @@ def kernel_images(
 
 def _kernel_filegroup_impl(ctx):
     all_deps = ctx.files.srcs + ctx.files.deps
+
+    # TODO(b/219112010): implement _KernelEnvInfo for the modules_prepare target
+    modules_prepare_out_dir_tar_gz = find_file("modules_prepare_outdir.tar.gz", all_deps, what = ctx.label)
+    modules_prepare_setup = """
+         # Restore modules_prepare outputs. Assumes env setup.
+           [ -z ${{OUT_DIR}} ] && echo "ERROR: modules_prepare setup run without OUT_DIR set!" >&2 && exit 1
+           tar xf {outdir_tar_gz} -C ${{OUT_DIR}}
+    """.format(outdir_tar_gz = modules_prepare_out_dir_tar_gz)
+    modules_prepare_deps = [modules_prepare_out_dir_tar_gz]
+
     kernel_module_dev_info = _KernelBuildExtModuleInfo(
         modules_staging_archive = find_file("modules_staging_dir.tar.gz", all_deps, what = ctx.label),
-        # TODO(b/219112010): implement _KernelEnvInfo for the modules_prepare target
-        modules_prepare = find_file("modules_prepare_outdir.tar.gz", all_deps, what = ctx.label),
+        modules_prepare_setup = modules_prepare_setup,
+        modules_prepare_deps = modules_prepare_deps,
         # TODO(b/211515836): module_srcs might also be downloaded
         module_srcs = _filter_module_srcs(ctx.files.kernel_srcs),
     )
