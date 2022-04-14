@@ -310,7 +310,7 @@ def _run_abidiff(old_dump, new_dump, diff_report, symbol_list, full_report):
     if symbol_list is not None:
         diff_abi_cmd.extend(["--kmi-whitelist", symbol_list])
 
-    rc = 0
+    abi_changed = False
 
     with open(diff_report, "w") as out:
         try:
@@ -318,9 +318,9 @@ def _run_abidiff(old_dump, new_dump, diff_report, symbol_list, full_report):
         except subprocess.CalledProcessError as e:
             if e.returncode & (ABIDIFF_ERROR | ABIDIFF_USAGE_ERROR):
                 raise
-            rc = e.returncode  # actual abi change
+            abi_changed = True  # actual abi change
 
-    return rc
+    return abi_changed
 
 
 def _shorten_abidiff(diff_report, short_report):
@@ -360,7 +360,7 @@ def _run_stgdiff(old_dump, new_dump, basename, symbol_list=None):
         for f in ["plain", "flat", "small", "viz"]:
             command.extend(["--format", f, "--output", f"{basename}.{f}"])
 
-        rc = 0
+        abi_changed = False
 
         with open(f"{basename}.errors", "w") as out:
             try:
@@ -368,9 +368,9 @@ def _run_stgdiff(old_dump, new_dump, basename, symbol_list=None):
             except subprocess.CalledProcessError as e:
                 if e.returncode & STGDIFF_ERROR:
                     raise
-                rc = e.returncode
+                abi_changed = True
 
-        return rc
+        return abi_changed
 
 
 def _reinterpret_stgdiff(abi_changed, report):
