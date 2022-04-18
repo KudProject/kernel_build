@@ -320,6 +320,7 @@ def _run_abidiff(old_dump, new_dump, diff_report, symbol_list, full_report):
             if e.returncode & (ABIDIFF_ERROR | ABIDIFF_USAGE_ERROR):
                 raise
             abi_changed = True  # actual abi change
+            print("ERROR: abidiff exit code ({0})\n".format(e.returncode))
 
     return abi_changed
 
@@ -371,6 +372,7 @@ def _run_stgdiff(old_dump, new_dump, basename, symbol_list=None):
                 if e.returncode & STGDIFF_ERROR:
                     raise
                 abi_changed = True
+                print("ERROR: stgdiff exit code ({0})\n".format(e.returncode))
 
         return abi_changed
 
