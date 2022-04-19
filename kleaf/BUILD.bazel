@@ -57,8 +57,10 @@ string_flag(
 
 exports_files([
     "preserve_env.sh",
-    "search_and_mv_output.py",
+    "search_and_cp_output.py",
+    "check_declared_output_list.py",
     "check_duplicated_files_in_archives.py",
+    "no_host_tool.sh",
 ])
 
 # Docs. To view them:
@@ -74,12 +76,14 @@ docs(
         "hermetic_tools.bzl",
         "kernel.bzl",
         "key_value_repo.bzl",
+        "print_debug.bzl",
         "update_source_file.bzl",
     ],
     default = "kernel.bzl",
     deps = [
         "utils.bzl",
         "//build/bazel_common_rules/dist",
+        "//build/kernel/kleaf/tests",
         "@bazel_skylib//lib:paths",
         "@bazel_skylib//rules:common_settings",
         "@kernel_toolchain_info//:dict",
@@ -104,4 +108,12 @@ platform(
         "OSFamily": "Linux",
     },
     parents = ["@local_config_platform//:host"],
+)
+
+# tests
+
+py_test(
+    name = "check_declared_output_list_test",
+    srcs = ["check_declared_output_list_test.py"],
+    python_version = "PY3",
 )
