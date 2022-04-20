@@ -406,6 +406,10 @@
 #         FILES="${FILES} rk3399-rock-pi-4b.dtb"
 #     where the dts file path is
 #     common-modules/virtual-device/rk3399-rock-pi-4b.dts
+#
+#   BUILD_GKI_CERTIFICATION_TOOLS
+#     if set to "1", build a gki_certification_tools.tar.gz, which contains
+#     the utilities used to certify GKI boot-*.img files.
 
 # Note: For historic reasons, internally, OUT_DIR will be copied into
 # COMMON_OUT_DIR, and OUT_DIR will be then set to
@@ -836,6 +840,17 @@ if [[ -z "${SKIP_EXT_MODULES}" ]] && [[ -n "${EXT_MODULES}" ]]; then
 
 fi
 
+if [ "${BUILD_GKI_CERTIFICATION_TOOLS}" = "1"  ]; then
+  GKI_CERTIFICATION_TOOLS_TAR="gki_certification_tools.tar.gz"
+  echo "========================================================"
+  echo " Generating ${GKI_CERTIFICATION_TOOLS_TAR}"
+  GKI_CERTIFICATION_BINARIES=(avbtool certify_bootimg)
+  GKI_CERTIFICATION_TOOLS_ROOT="${ROOT_DIR}/prebuilts/kernel-build-tools/linux-x86"
+  GKI_CERTIFICATION_FILES="${GKI_CERTIFICATION_BINARIES[@]/#/bin/}"
+  tar -czf ${DIST_DIR}/${GKI_CERTIFICATION_TOOLS_TAR} \
+    -C ${GKI_CERTIFICATION_TOOLS_ROOT} ${GKI_CERTIFICATION_FILES}
+fi
+
 echo "========================================================"
 echo " Generating test_mappings.zip"
 TEST_MAPPING_FILES=${OUT_DIR}/test_mapping_files.txt
@@ -1008,10 +1023,8 @@ if [ "${BUILD_SYSTEM_DLKM}" = "1"  ]; then
   tar -czf "${DIST_DIR}/system_dlkm_staging_archive.tar.gz" -C "${SYSTEM_DLKM_STAGING_DIR}" .
 
   # No need to sign the image as modules are signed
-  SYSTEM_DLKM_PARTITION_SIZE=$((64 << 20))
-  avbtool add_hash_footer \
+  avbtool add_hashtree_footer \
     --partition_name system_dlkm \
-    --partition_size ${SYSTEM_DLKM_PARTITION_SIZE} \
     --image "${DIST_DIR}/system_dlkm.img"
 fi
 
@@ -1019,11 +1032,13 @@ fi
 if [ -n "${ABL_SRC}" ]; then
   if [ -e "${ROOT_DIR}/${ABL_SRC}" ]; then
     if [ -n "${MSM_ARCH}" ]; then
+      [ -z "${TARGET_BUILD_VARIANT}" ] && TARGET_BUILD_VARIANT=userdebug
       ABL_ENVIRON=("ABL_SRC=${ABL_SRC}")
       ABL_ENVIRON+=("ABL_OUT_DIR=${COMMON_OUT_DIR}")
       ABL_ENVIRON+=("ABL_IMAGE_DIR=${DIST_DIR}")
-      BUILD_VARIANTS=("userdebug")
-      [ -n "${COMPILE_ABL}" ] && BUILD_VARIANTS+=("user")
+      BUILD_VARIANTS=("${TARGET_BUILD_VARIANT}")
+      # Define COMPILE_ABL then need to compile userdebug and user abl
+      [ -n "${COMPILE_ABL}" ] && BUILD_VARIANTS=("userdebug" "user")
       for variant in "${BUILD_VARIANTS[@]}"
       do
         ( env -i bash -c "source ${ABL_OLD_ENVIRONMENT}; \
@@ -1031,7 +1046,6 @@ if [ -n "${ABL_SRC}" ]; then
         export ${ABL_ENVIRON[*]} ; \
         ./build/build_abl.sh ${MSM_ARCH}" )
       done
-      [ -z "${TARGET_BUILD_VARIANT}" ] && TARGET_BUILD_VARIANT=userdebug
       if [ -e "${DIST_DIR}/abl_${TARGET_BUILD_VARIANT}.elf" ]; then
         ln -sf ${DIST_DIR}/abl_${TARGET_BUILD_VARIANT}.elf ${DIST_DIR}/abl.elf
       fi
