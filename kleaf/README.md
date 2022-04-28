@@ -1,7 +1,5 @@
 # Kleaf - Building Android Kernels with Bazel
 
-**Note:** THIS IS EXPERIMENTAL AND INCOMPLETE. USE WITH CAUTION!
-
 ## Table of contents
 
 [Introduction to Kleaf](docs/kleaf.md)
@@ -17,3 +15,11 @@
 [Kleaf testing](docs/testing.md)
 
 [Cheatsheet](docs/cheatsheet.md)
+
+### Configurations
+
+`--config=release`: [Release builds](docs/release.md)
+
+`--config=fast`: [Make local builds faster](docs/fast.md)
+
+`--config=local`: [Sandboxing](docs/sandbox.md)
