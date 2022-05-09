@@ -1029,6 +1029,7 @@ if [ "${BUILD_SYSTEM_DLKM}" = "1"  ]; then
     ${SYSTEM_DLKM_STAGING_DIR} "${MODULES_BLOCKLIST}" "-e"
 
   SYSTEM_DLKM_ROOT_DIR=$(echo ${SYSTEM_DLKM_STAGING_DIR}/lib/modules/*)
+  cp ${SYSTEM_DLKM_ROOT_DIR}/modules.load ${DIST_DIR}/system_dlkm.modules.load
   # Re-sign the stripped modules using kernel build time key
   find ${SYSTEM_DLKM_STAGING_DIR} -type f -name "*.ko" \
     -exec ${OUT_DIR}/scripts/sign-file sha1 \
