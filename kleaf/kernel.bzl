@@ -16,6 +16,7 @@ load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@kernel_toolchain_info//:dict.bzl", "CLANG_VERSION")
 load(":constants.bzl", "TOOLCHAIN_VERSION_FILENAME")
+load(":directory_with_structure.bzl", dws = "directory_with_structure")
 load(":hermetic_tools.bzl", "HermeticToolsInfo")
 load(":update_source_file.bzl", "update_source_file")
 load(
@@ -24,6 +25,7 @@ load(
     "find_files",
     "getoptattr",
     "reverse_dict",
+    "utils",
 )
 load(
     "//build/kernel/kleaf/tests:kernel_test.bzl",
@@ -953,6 +955,48 @@ _kernel_env = rule(
     },
 )
 
+def _determine_raw_symbollist_path(ctx):
+    """A local action that stores the path to `abi_symbollist.raw` to a file object."""
+
+    # Use a local action so we get an absolute path in the execroot that
+    # does not tear down as sandbxes. Then write the absolute path into the
+    # abi_symbollist.raw.abspath.
+    #
+    # In practice, the absolute path looks something like:
+    #    /<workspace_root>/out/bazel/output_user_root/<hash>/execroot/__main__/bazel-out/k8-fastbuild/bin/common/kernel_aarch64_raw_kmi_symbol_list/abi_symbollist.raw
+    #
+    # Alternatively, we could use a relative path. However, gen_autoksyms.sh
+    # interprets relative paths as paths relative to $abs_srctree, which
+    # is $(realpath $ROOT_DIR/$KERNEL_DIR). The $abs_srctree is:
+    # - A path within the sandbox for sandbox actions
+    # - /<workspace_root>/$KERNEL_DIR for local actions
+    # Whether KernelConfig is executed in a sandbox may not be consistent with
+    # whether a dependant action is executed in a sandbox. This causes the
+    # interpretation of CONFIG_UNUSED_KSYMS_WHITELIST inconsistent in the
+    # two actions. Hence, we stick with absolute paths.
+    #
+    # NOTE: This may hurt remote caching for developer builds. We may want to
+    # re-visit this when we implement remote caching for developers.
+    abspath = ctx.actions.declare_file("{}/abi_symbollist.raw.abspath".format(ctx.attr.name))
+    command = ctx.attr._hermetic_tools[HermeticToolsInfo].setup + """
+      # Record the absolute path so we can use in .config
+        readlink -e {raw_kmi_symbol_list} > {abspath}
+    """.format(
+        abspath = abspath.path,
+        raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path,
+    )
+    ctx.actions.run_shell(
+        command = command,
+        inputs = ctx.attr._hermetic_tools[HermeticToolsInfo].deps + [ctx.file.raw_kmi_symbol_list],
+        outputs = [abspath],
+        mnemonic = "KernelConfigLocalRawSymbolList",
+        progress_message = "Determining raw symbol list path for trimming {}".format(ctx.label),
+        execution_requirements = {
+            "local": "1",
+        },
+    )
+    return abspath
+
 def _kernel_config_impl(ctx):
     inputs = [
         s
@@ -1009,27 +1053,17 @@ def _kernel_config_impl(ctx):
 
     trim_kmi_command = ""
     if ctx.attr.trim_nonlisted_kmi:
-        # We can't use an absolute path in CONFIG_UNUSED_KSYMS_WHITELIST.
-        # - ctx.file.raw_kmi_symbol_list is a relative path (e.g.
-        #   bazel-out/k8-fastbuild/bin/common/kernel_aarch64_raw_kmi_symbol_list/abi_symbollist.raw)
-        # - Canonicalizing the path gives an absolute path into the sandbox of
-        #   the _kernel_config rule. The sandbox is destroyed during the
-        #   execution of _kernel_build.
-        # Hence we use a relative path. In this case, it is
-        # interpreted as a path relative to $abs_srctree, which is
-        # ${ROOT_DIR}/${KERNEL_DIR}. See common/scripts/gen_autoksyms.sh.
-        # Hence we set CONFIG_UNUSED_KSYMS_WHITELIST to the path of abi_symobllist.raw
-        # relative to ${KERNEL_DIR}.
+        raw_symbol_list_path_file = _determine_raw_symbollist_path(ctx)
         trim_kmi_command = """
             # Modify .config to trim symbols not listed in KMI
-              ${{KERNEL_DIR}}/scripts/config --file ${{OUT_DIR}}/.config \
-                  -d UNUSED_SYMBOLS -e TRIM_UNUSED_KSYMS \
-                  --set-str UNUSED_KSYMS_WHITELIST $(rel_path {raw_kmi_symbol_list} ${{KERNEL_DIR}})
+              ${{KERNEL_DIR}}/scripts/config --file ${{OUT_DIR}}/.config \\
+                  -d UNUSED_SYMBOLS -e TRIM_UNUSED_KSYMS \\
+                  --set-str UNUSED_KSYMS_WHITELIST $(cat {raw_symbol_list_path_file})
               make -C ${{KERNEL_DIR}} ${{TOOL_ARGS}} O=${{OUT_DIR}} olddefconfig
-        """.format(raw_kmi_symbol_list = ctx.file.raw_kmi_symbol_list.path)
-
-        # rel_path requires the file to exist.
-        inputs.append(ctx.file.raw_kmi_symbol_list)
+        """.format(
+            raw_symbol_list_path_file = raw_symbol_list_path_file.path,
+        )
+        inputs.append(raw_symbol_list_path_file)
 
     command = ctx.attr.env[_KernelEnvInfo].setup + """
         # Pre-defconfig commands
@@ -1073,7 +1107,10 @@ def _kernel_config_impl(ctx):
            rsync -aL {include_dir}/ ${{OUT_DIR}}/include/
            find ${{OUT_DIR}}/include -type d -exec chmod +w {{}} \\;
     """.format(config = config.path, include_dir = include_dir.path)
-    if ctx.file.raw_kmi_symbol_list:
+
+    if ctx.attr.trim_nonlisted_kmi:
+        # Ensure the dependent action uses the up-to-date abi_symbollist.raw
+        # at the absolute path specified in abi_symbollist.raw.abspath
         setup_deps.append(ctx.file.raw_kmi_symbol_list)
 
     return [
@@ -1101,6 +1138,7 @@ _kernel_config = rule(
             doc = "Label to abi_symbollist.raw.",
             allow_single_file = True,
         ),
+        "_hermetic_tools": attr.label(default = "//build/kernel:hermetic-tools", providers = [HermeticToolsInfo]),
         "_debug_print_scripts": attr.label(default = "//build/kernel/kleaf:debug_print_scripts"),
     },
 )
@@ -1786,7 +1824,7 @@ _KernelModuleInfo = provider(fields = {
     "kernel_build": "kernel_build attribute of this module",
     "modules_staging_archive": "Archive containing staging kernel modules. " +
                                "Contains the lib/modules/* suffix.",
-    "kernel_uapi_headers_archive": "Archive containing UAPI headers to use the module.",
+    "kernel_uapi_headers_dws": "`directory_with_structure` containing UAPI headers to use the module.",
 })
 
 def _check_kernel_build(kernel_modules, kernel_build, this_label):
@@ -1830,28 +1868,20 @@ def _kernel_module_impl(ctx):
         inputs += kernel_module_dep[_KernelEnvInfo].dependencies
 
     modules_staging_archive = ctx.actions.declare_file("{}/modules_staging_archive.tar.gz".format(ctx.attr.name))
-    modules_staging_dir = modules_staging_archive.dirname + "/staging"
-    kernel_uapi_headers_archive = ctx.actions.declare_file("{}/kernel-uapi-headers.tar.gz".format(ctx.attr.name))
-    kernel_uapi_headers_dir = kernel_uapi_headers_archive.dirname + "/kernel-uapi-headers.tar.gz_staging"
-    outdir = modules_staging_archive.dirname  # equivalent to declare_directory(ctx.attr.name)
+    modules_staging_dws = dws.make(ctx, "{}/staging".format(ctx.attr.name))
+    kernel_uapi_headers_dws = dws.make(ctx, "{}/kernel-uapi-headers.tar.gz_staging".format(ctx.attr.name))
+    outdir = modules_staging_dws.directory.dirname
 
     unstripped_dir = None
     if ctx.attr.kernel_build[_KernelBuildExtModuleInfo].collect_unstripped_modules:
         unstripped_dir = ctx.actions.declare_directory("{name}/unstripped".format(name = ctx.label.name))
-
-    # additional_outputs: archives + unstripped + [basename(out) for out in outs]
-    additional_outputs = [
-        modules_staging_archive,
-        kernel_uapi_headers_archive,
-    ]
-    if unstripped_dir:
-        additional_outputs.append(unstripped_dir)
 
     # Original `outs` attribute of `kernel_module` macro.
     original_outs = []
 
     # apply basename to all of original_outs
     original_outs_base = []
+
     for out in ctx.outputs.outs:
         # outdir includes target name at the end already. So short_name is the original
         # token in `outs` of `kernel_module` macro.
@@ -1862,27 +1892,26 @@ def _kernel_module_impl(ctx):
         #   => short_name = "bar"
         short_name = out.path[len(outdir) + 1:]
         original_outs.append(short_name)
-        if "/" in short_name:
-            additional_outputs.append(ctx.actions.declare_file("{name}/{basename}".format(
-                name = ctx.attr.name,
-                basename = out.basename,
-            )))
         original_outs_base.append(out.basename)
 
     module_symvers = ctx.actions.declare_file("{}/Module.symvers".format(ctx.attr.name))
-    additional_declared_outputs = [
+    command_outputs = [
+        modules_staging_archive,
         module_symvers,
     ]
+    command_outputs += dws.files(modules_staging_dws)
+    command_outputs += dws.files(kernel_uapi_headers_dws)
+    if unstripped_dir:
+        command_outputs.append(unstripped_dir)
 
     command = ""
     command += ctx.attr.kernel_build[_KernelEnvInfo].setup
     command += ctx.attr.kernel_build[_KernelBuildExtModuleInfo].modules_prepare_setup
     command += """
              # create dirs for modules
-               mkdir -p {modules_staging_dir} {kernel_uapi_headers_dir}/usr
+               mkdir -p {kernel_uapi_headers_dir}/usr
     """.format(
-        modules_staging_dir = modules_staging_dir,
-        kernel_uapi_headers_dir = kernel_uapi_headers_dir,
+        kernel_uapi_headers_dir = kernel_uapi_headers_dws.directory.path,
     )
     for kernel_module_dep in ctx.attr.kernel_module_deps:
         command += kernel_module_dep[_KernelEnvInfo].setup
@@ -1945,38 +1974,65 @@ def _kernel_module_impl(ctx):
                  fi
                  tar czf ${{modules_staging_archive}} {modules_staging_outs} ${{mod_order}}
                )
-             # Move files into place
-               {search_and_cp_output} --srcdir {modules_staging_dir}/lib/modules/*/extra/{ext_mod}/ --dstdir {outdir} {outs}
              # Grab unstripped modules
                {grab_unstripped_cmd}
-             # Create headers archive
-               tar czf {kernel_uapi_headers_archive} --directory={kernel_uapi_headers_dir} usr/
-             # Remove staging dirs because they are not declared
-               rm -rf {modules_staging_dir} {kernel_uapi_headers_dir}
              # Move Module.symvers
                mv ${{OUT_DIR}}/${{ext_mod_rel}}/Module.symvers {module_symvers}
                """.format(
         ext_mod = ctx.attr.ext_mod,
-        search_and_cp_output = ctx.file._search_and_cp_output.path,
         module_symvers = module_symvers.path,
-        modules_staging_dir = modules_staging_dir,
+        modules_staging_dir = modules_staging_dws.directory.path,
         modules_staging_archive = modules_staging_archive.path,
         outdir = outdir,
-        outs = " ".join(original_outs),
         modules_staging_outs = " ".join(modules_staging_outs),
-        kernel_uapi_headers_archive = kernel_uapi_headers_archive.path,
-        kernel_uapi_headers_dir = kernel_uapi_headers_dir,
+        kernel_uapi_headers_dir = kernel_uapi_headers_dws.directory.path,
         grab_unstripped_cmd = grab_unstripped_cmd,
     )
+
+    command += dws.record(modules_staging_dws)
+    command += dws.record(kernel_uapi_headers_dws)
 
     _debug_print_scripts(ctx, command)
     ctx.actions.run_shell(
         mnemonic = "KernelModule",
         inputs = inputs,
-        outputs = ctx.outputs.outs + additional_outputs +
-                  additional_declared_outputs,
+        outputs = command_outputs,
         command = command,
         progress_message = "Building external kernel module {}".format(ctx.label),
+    )
+
+    # Additional outputs because of the value in outs. This is
+    # [basename(out) for out in outs] - outs
+    additional_declared_outputs = []
+    for short_name, out in zip(original_outs, ctx.outputs.outs):
+        if "/" in short_name:
+            additional_declared_outputs.append(ctx.actions.declare_file("{name}/{basename}".format(
+                name = ctx.attr.name,
+                basename = out.basename,
+            )))
+        original_outs_base.append(out.basename)
+
+    command = ctx.attr._hermetic_tools[HermeticToolsInfo].setup + """
+         # Copy files into place
+           {search_and_cp_output} --srcdir {modules_staging_dir}/lib/modules/*/extra/{ext_mod}/ --dstdir {outdir} {outs}
+    """.format(
+        search_and_cp_output = ctx.file._search_and_cp_output.path,
+        modules_staging_dir = modules_staging_dws.directory.path,
+        ext_mod = ctx.attr.ext_mod,
+        outdir = outdir,
+        outs = " ".join(original_outs),
+    )
+    _debug_print_scripts(ctx, command, what = "cp_outputs")
+    ctx.actions.run_shell(
+        mnemonic = "KernelModuleCpOutputs",
+        inputs = ctx.attr._hermetic_tools[HermeticToolsInfo].deps + [
+            # We don't need structure_file here because we only care about files in the directory.
+            modules_staging_dws.directory,
+            ctx.file._search_and_cp_output,
+        ],
+        outputs = ctx.outputs.outs + additional_declared_outputs,
+        command = command,
+        progress_message = "Copying outputs {}".format(ctx.label),
     )
 
     setup = """
@@ -2006,13 +2062,13 @@ def _kernel_module_impl(ctx):
             runfiles = ctx.runfiles(files = ctx.outputs.outs),
         ),
         _KernelEnvInfo(
-            dependencies = additional_declared_outputs,
+            dependencies = [module_symvers],
             setup = setup,
         ),
         _KernelModuleInfo(
             kernel_build = ctx.attr.kernel_build,
             modules_staging_archive = modules_staging_archive,
-            kernel_uapi_headers_archive = kernel_uapi_headers_archive,
+            kernel_uapi_headers_dws = kernel_uapi_headers_dws,
         ),
         _KernelUnstrippedModulesInfo(
             directory = unstripped_dir,
@@ -2042,6 +2098,7 @@ _kernel_module = rule(
         # Not output_list because it is not a list of labels. The list of
         # output labels are inferred from name and outs.
         "outs": attr.output_list(),
+        "_hermetic_tools": attr.label(default = "//build/kernel:hermetic-tools", providers = [HermeticToolsInfo]),
         "_search_and_cp_output": attr.label(
             allow_single_file = True,
             default = Label("//build/kernel/kleaf:search_and_cp_output.py"),
@@ -2410,18 +2467,20 @@ def _merged_kernel_uapi_headers_impl(ctx):
     kernel_build = ctx.attr.kernel_build
     base_kernel = kernel_build[_KernelBuildUapiInfo].base_kernel
 
-    # Early elements = higher priority
+    # srcs and dws_srcs are the list of sources to merge.
+    # Early elements = higher priority. srcs has higher priority than dws_srcs.
     srcs = []
     if base_kernel:
         srcs += base_kernel[_KernelBuildUapiInfo].kernel_uapi_headers.files.to_list()
     srcs += kernel_build[_KernelBuildUapiInfo].kernel_uapi_headers.files.to_list()
-    for kernel_module in ctx.attr.kernel_modules:
-        srcs.append(kernel_module[_KernelModuleInfo].kernel_uapi_headers_archive)
+    dws_srcs = [kernel_module[_KernelModuleInfo].kernel_uapi_headers_dws for kernel_module in ctx.attr.kernel_modules]
 
-    inputs = ctx.attr._hermetic_tools[HermeticToolsInfo].deps + srcs
+    inputs = srcs + ctx.attr._hermetic_tools[HermeticToolsInfo].deps
+    for dws_src in dws_srcs:
+        inputs += dws.files(dws_src)
 
     out_file = ctx.actions.declare_file("{}/kernel-uapi-headers.tar.gz".format(ctx.attr.name))
-    intermediates_dir = out_file.dirname + "/intermediates"
+    intermediates_dir = utils.intermediates_dir(ctx)
 
     command = ""
     command += ctx.attr._hermetic_tools[HermeticToolsInfo].setup
@@ -2432,6 +2491,15 @@ def _merged_kernel_uapi_headers_impl(ctx):
     )
 
     # Extract the source tarballs in low to high priority order.
+    for dws_src in reversed(dws_srcs):
+        # Copy the directory over, overwriting existing files. Add write permission
+        # targets with higher priority can overwrite existing files.
+        command += dws.restore(
+            dws_src,
+            dst = intermediates_dir,
+            options = "-aL --chmod=+w",
+        )
+
     for src in reversed(srcs):
         command += """
             tar xf {src} -C {intermediates_dir}
@@ -3364,11 +3432,37 @@ def _kernel_filegroup_impl(ctx):
     uapi_info = _KernelBuildUapiInfo(
         kernel_uapi_headers = ctx.attr.kernel_uapi_headers,
     )
+
+    unstripped_modules_info = None
+    for target in ctx.attr.srcs:
+        if _KernelUnstrippedModulesInfo in target:
+            unstripped_modules_info = target[_KernelUnstrippedModulesInfo]
+            break
+    if unstripped_modules_info == None:
+        # Reverse of kernel_unstripped_modules_archive
+        unstripped_modules_archive = find_file("unstripped_modules.tar.gz", all_deps, what = ctx.label, required = True)
+        unstripped_dir = ctx.actions.declare_directory("{}/unstripped".format(ctx.label.name))
+        command = ctx.attr._hermetic_tools[HermeticToolsInfo].setup + """
+            tar xf {unstripped_modules_archive} -C $(dirname {unstripped_dir}) $(basename {unstripped_dir})
+        """
+        _debug_print_scripts(ctx, command, what = "unstripped_modules_archive")
+        ctx.actions.run_shell(
+            command = command,
+            inputs = ctx.attr._hermetic_tools[HermeticToolsInfo].deps + [
+                unstripped_modules_archive,
+            ],
+            outputs = [unstripped_dir],
+            progress_message = "Extracting unstripped_modules_archive {}".format(ctx.label),
+            mnemonic = "KernelFilegroupUnstrippedModulesArchive",
+        )
+        unstripped_modules_info = _KernelUnstrippedModulesInfo(directory = unstripped_dir)
+
     return [
         DefaultInfo(files = depset(ctx.files.srcs)),
         kernel_module_dev_info,
         # TODO(b/219112010): implement _KernelEnvInfo for _kernel_build
         uapi_info,
+        unstripped_modules_info,
     ]
 
 kernel_filegroup = rule(
@@ -3452,6 +3546,7 @@ Unlike `kernel_build`, this has default value `True` because
 default, which in turn sets `collect_unstripped_modules` to `True` by default.
 """,
         ),
+        "_hermetic_tools": attr.label(default = "//build/kernel:hermetic-tools", providers = [HermeticToolsInfo]),
     },
 )
 
@@ -3495,8 +3590,9 @@ def _kernel_kythe_impl(ctx):
     compile_commands = ctx.file.compile_commands
     all_kzip = ctx.actions.declare_file(ctx.attr.name + "/all.kzip")
     runextractor_error = ctx.actions.declare_file(ctx.attr.name + "/runextractor_error.log")
-    kzip_dir = all_kzip.dirname + "/intermediates"
-    extracted_kzip_dir = all_kzip.dirname + "/extracted"
+    intermediates_dir = utils.intermediates_dir(ctx)
+    kzip_dir = intermediates_dir + "/kzip"
+    extracted_kzip_dir = intermediates_dir + "/extracted"
     transitive_inputs = [src.files for src in ctx.attr.kernel_build[_SrcsInfo].srcs]
     inputs = [compile_commands]
     inputs += ctx.attr.kernel_build[_KernelEnvInfo].dependencies
@@ -3574,7 +3670,7 @@ def _kernel_extracted_symbols_impl(ctx):
         ))
 
     out = ctx.actions.declare_file("{}/extracted_symbols".format(ctx.attr.name))
-    genfiles_dir = ctx.genfiles_dir.path
+    intermediates_dir = utils.intermediates_dir(ctx)
 
     vmlinux = find_file(name = "vmlinux", files = ctx.files.kernel_build_notrim, what = "{}: kernel_build_notrim".format(ctx.attr.name), required = True)
     in_tree_modules = find_files(suffix = ".ko", files = ctx.files.kernel_build_notrim, what = "{}: kernel_build_notrim".format(ctx.attr.name))
@@ -3587,11 +3683,13 @@ def _kernel_extracted_symbols_impl(ctx):
 
     command = ctx.attr.kernel_build_notrim[_KernelEnvInfo].setup
     command += """
-        cp -pl {srcs} {genfiles_dir}
-        {extract_symbols} --symbol-list {out} {skip_module_grouping_flag} {genfiles_dir}
+        mkdir -p {intermediates_dir}
+        cp -pl {srcs} {intermediates_dir}
+        {extract_symbols} --symbol-list {out} {skip_module_grouping_flag} {intermediates_dir}
+        rm -rf {intermediates_dir}
     """.format(
         srcs = " ".join([file.path for file in srcs]),
-        genfiles_dir = genfiles_dir,
+        intermediates_dir = intermediates_dir,
         extract_symbols = ctx.file._extract_symbols.path,
         out = out.path,
         skip_module_grouping_flag = "" if ctx.attr.module_grouping else "--skip-module-grouping",
@@ -3643,7 +3741,7 @@ def _kernel_abi_dump_epilog_cmd(path, append_version):
     return ret
 
 def _kernel_abi_dump_full(ctx):
-    abi_linux_tree = ctx.genfiles_dir.path + "/abi_linux_tree"
+    abi_linux_tree = utils.intermediates_dir(ctx) + "/abi_linux_tree"
     full_abi_out_file = ctx.actions.declare_file("{}/abi-full.xml".format(ctx.attr.name))
     vmlinux = find_file(name = "vmlinux", files = ctx.files.kernel_build, what = "{}: kernel_build".format(ctx.attr.name), required = True)
 
@@ -3667,6 +3765,7 @@ def _kernel_abi_dump_full(ctx):
         cp -pl {vmlinux} {abi_linux_tree}
         {dump_abi} --linux-tree {abi_linux_tree} --out-file {full_abi_out_file}
         {epilog}
+        rm -rf {abi_linux_tree}
     """.format(
         abi_linux_tree = abi_linux_tree,
         unstripped_dirs = " ".join([unstripped_dir.path for unstripped_dir in unstripped_dirs]),
