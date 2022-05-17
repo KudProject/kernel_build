@@ -1,4 +1,3 @@
-#!/bin/bash -e
 # Copyright (C) 2022 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Script used as --workspace_status_command.
-# Must execute at the root of workspace.
-# https://docs.bazel.build/versions/main/command-line-reference.html#flag--workspace_status_command
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 
-if [[ ! -f "WORKSPACE" ]]; then
-  echo "ERROR: workspace_status.sh must be executed at the root of Bazel workspace." >&2
-  exit 1
-fi
+def _impl(ctx):
+    for flag in ctx.attr.flags:
+        print("{}={}".format(flag.label, flag[BuildSettingInfo].value))
 
-build/kernel/build-tools/path/linux-x86/python3 build/kernel/kleaf/workspace_status.py
+print_flags = rule(
+    doc = "A rule that prints flags",
+    implementation = _impl,
+    attrs = {
+        "flags": attr.label_list(providers = [BuildSettingInfo]),
+    },
+)

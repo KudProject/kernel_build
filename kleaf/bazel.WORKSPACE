@@ -32,6 +32,14 @@ local_repository(
     path = "external/stardoc",
 )
 
+# The prebuilt NDK does not support Bazel.
+# https://docs.bazel.build/versions/main/external.html#non-bazel-projects
+new_local_repository(
+    name = "prebuilt_ndk",
+    path = "prebuilts/ndk-r23",
+    build_file = "build/kernel/kleaf/ndk.BUILD",
+)
+
 key_value_repo(
     name = "kernel_toolchain_info",
     srcs = ["//common:build.config.constants"],
@@ -42,4 +50,8 @@ download_artifacts_repo(
     files = CI_TARGET_MAPPING["kernel_aarch64"]["outs"] +
             [out for config in GKI_DOWNLOAD_CONFIGS for out in config["outs"]],
     target = "kernel_kleaf",
+)
+
+register_toolchains(
+    "//prebuilts/build-tools:py_toolchain"
 )

@@ -171,7 +171,25 @@ Define a `copy_to_dist_dir` target that includes the targets you want in the
 distribution directory. The name of this `copy_to_dist_dir` target is usually
 the name of your device with `_dist` appended to it, e.g. `tuna_dist`.
 
-Set `flat = True` so the directory structure within `$DIST_DIR` is flattened.
+Set `flat = True` so the directory structure within `dist_dir` is flattened.
+
+Set `dist_dir` so there's less typing at build time. For example:
+
+```text
+copy_to_dist_dir(
+   dist_dir = "out/dist"
+)
+```
+
+... or if you want to be strictly consistent with the behavior of `build.sh`:
+
+```text
+load("@kernel_toolchain_info//:dict.bzl", "BRANCH")
+copy_to_dist_dir(
+   # ...
+   dist_dir = "out/{branch}/dist".format(branch = BRANCH)
+)
+```
 
 Add the following to the `data` attribute of the `copy_to_dist_dir` target so
 that the outputs are analogous to those produced by `build/build.sh`:
@@ -202,7 +220,8 @@ Example for Pixel 2021 (see the `copy_to_dist_dir` target named `slider_dist`):
 # During development, you may want to wipe, disable verity and disable verification.
 # fastboot update tuna-img.zip -w --disable-verity --disable-verification
 
-$ tools/bazel run //private/path/to/sources:tuna_dist -- --dist_dir=out/dist
+# Assuming dist_dir=out/dist
+$ tools/bazel run //private/path/to/sources:tuna_dist
 # Flash static partitions
 $ fastboot flash boot out/dist/boot.img
 $ fastboot flash system_dlkm out/dist/system_dlkm.img
@@ -217,6 +236,10 @@ $ fastboot reboot
 ## Resolving common errors
 
 See [errors.md](errors.md).
+
+## Handling SCM version
+
+See [scmversion.md](scmversion.md).
 
 ## Advanced usage
 
@@ -250,9 +273,20 @@ You only need to **do this once** per workspace.
 
 ```shell
 # Do this at workspace root next to the file WORKSPACE
-$ test -f WORKSPACE && echo 'build --//build/kernel/kleaf:lto=none' >> user.bazelrc
+$ test -f WORKSPACE && echo 'build --lto=none' >> user.bazelrc
 # Future builds in this workspace always disables LTO.
 $ tools/bazel build //private/path/to/sources:tuna_dist
+```
+
+If you are using `--config=fast`, you need to add `build:fast --lto=none` as
+well, because `--config=fast` implies thin LTO. See [fast.md](fast.md#lto).
+
+#### Confirming the value of --lto
+
+You may build the following to confirm the value of LTO setting:
+
+```shell
+$ tools/bazel build //build/kernel/kleaf:print_flags
 ```
 
 ### Using configurable build attributes `select()`

@@ -281,7 +281,8 @@
 #
 #   BUILD_SYSTEM_DLKM
 #     if set to "1", build a system_dlkm.img containing all signed GKI modules
-#     and resulting depmod artifacts
+#     and resulting depmod artifacts. GKI build exclusive; DO NOT USE with device
+#     build configs files.
 #
 #   MODULES_OPTIONS
 #     A /lib/modules/modules.options file is created on the ramdisk containing
@@ -469,6 +470,27 @@ function build_super() {
 export ROOT_DIR=$($(dirname $(readlink -f $0))/gettop.sh)
 source "${ROOT_DIR}/build/build_utils.sh"
 source "${ROOT_DIR}/build/_setup_env.sh"
+
+(
+    [[ "$KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING" == "1" ]] && exit 0 || true
+    echo     "************************************************************************" >&2
+    echo     "* WARNING: build.sh is deprecated for this branch. Please migrate to Bazel."
+    echo     "*   See build/kernel/kleaf/README.md"
+    echo -ne "*          Inferring equivalent Bazel command...\r"
+    bazel_command_code=0
+    eq_bazel_command=$(${ROOT_DIR}/build/kernel/kleaf/convert_to_bazel.sh 2>&1) || bazel_command_code=$?
+    if [[ $bazel_command_code -eq 0 ]]; then
+        echo "*          Possibly equivalent Bazel command:                           " >&2
+        echo "*" >&2
+        echo "*   \$ $eq_bazel_command" >&2
+        echo "*" >&2
+    else
+        echo "WARNING: Unable to infer an equivalent Bazel command." >&2
+    fi
+    echo     "* To suppress this warning, set KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING=1"
+    echo     "************************************************************************" >&2
+    echo >&2
+)
 
 MAKE_ARGS=( "$@" )
 export MAKEFLAGS="-j$(nproc) ${MAKEFLAGS}"
@@ -716,7 +738,7 @@ fi
 if [ -n "${KMI_SYMBOL_LIST}" ]; then
   ${ROOT_DIR}/build/abi/process_symbols --out-dir="$DIST_DIR" --out-file=abi_symbollist \
     --report-file=abi_symbollist.report --in-dir="$ROOT_DIR/$KERNEL_DIR" \
-    "${KMI_SYMBOL_LIST}" ${ADDITIONAL_KMI_SYMBOL_LISTS}
+    "${KMI_SYMBOL_LIST}" ${ADDITIONAL_KMI_SYMBOL_LISTS} ${MSM_KMI_SYMBOL_LIST}
   pushd $ROOT_DIR/$KERNEL_DIR
   if [ "${TRIM_NONLISTED_KMI}" = "1" ]; then
       # Create the raw symbol list

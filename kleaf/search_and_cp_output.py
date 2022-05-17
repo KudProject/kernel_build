@@ -13,6 +13,7 @@ def handle_outputs_with_slash(srcdir, dstdir, outputs):
     for sdir in srcdir:
       if os.path.exists(os.path.join(sdir, out)):
         shutil.copy(os.path.join(sdir, out), dstdir)
+        os.makedirs(os.path.dirname(os.path.join(dstdir, out)), exist_ok=True)
         shutil.copy(os.path.join(sdir, out), os.path.join(dstdir, out))
         found = True
         break
@@ -34,7 +35,7 @@ def handle_outputs_without_slash(srcdir, dstdir, outputs):
         found = True
         break
       if not found:
-        ok, matches = search_and_mv_output_one(sdir, dstdir, out)
+        ok, matches = search_and_cp_output_one(sdir, dstdir, out)
         if ok:
           found = True
           break
@@ -52,7 +53,7 @@ def handle_outputs_without_slash(srcdir, dstdir, outputs):
   return errors
 
 
-def search_and_mv_output_one(srcdir, dstdir, out):
+def search_and_cp_output_one(srcdir, dstdir, out):
   """Implements the search and move logic for outputs that need to be located.
 
   For each output in <outputs>, searches <output> within <srcdir>, and moves it
