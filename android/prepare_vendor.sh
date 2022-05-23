@@ -271,12 +271,12 @@ if [ "${COPY_NEEDED}" == "1" ]; then
   fi
 
   system_dlkm_kos=$(mktemp)
-  if [ -e ${ANDROID_KP_OUT_DIR}/dist/system_dlkm.modules.load ]; then
+  if [ -s ${ANDROID_KP_OUT_DIR}/dist/system_dlkm.modules.load ]; then
     cat ${ANDROID_KP_OUT_DIR}/dist/system_dlkm.modules.load | \
     xargs -L 1 basename | \
     xargs -L 1 find ${ANDROID_KP_OUT_DIR}/dist/ -name > ${system_dlkm_kos}
   else
-    echo "  system_dlkm_kos.modules.load file is not found"
+    echo "  system_dlkm_kos.modules.load file is not found or is empty"
   fi
 
   rm -rf ${ANDROID_KERNEL_OUT}/system_dlkm/*
