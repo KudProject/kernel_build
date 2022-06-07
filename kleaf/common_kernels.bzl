@@ -30,12 +30,15 @@ load("//build/bazel_common_rules/dist:dist.bzl", "copy_to_dist_dir")
 load("//build/kernel/kleaf/impl:gki_artifacts.bzl", "gki_artifacts")
 load("//build/kernel/kleaf/impl:utils.bzl", "utils")
 load(
+    "//build/kernel/kleaf/impl:constants.bzl",
+    "MODULE_OUTS_FILE_OUTPUT_GROUP",
+    "MODULE_OUTS_FILE_SUFFIX",
+)
+load(
     ":constants.bzl",
     "CI_TARGET_MAPPING",
     "GKI_DOWNLOAD_CONFIGS",
     "GKI_MODULES",
-    "MODULE_OUTS_FILE_OUTPUT_GROUP",
-    "MODULE_OUTS_FILE_SUFFIX",
     "aarch64_outs",
     "x86_64_outs",
 )
@@ -527,12 +530,8 @@ def define_common_kernels(
             transformed_boot_img_sizes = {}
             for out in arch_config["outs"]:
                 basename = paths.basename(out)
-                if basename == "Image":
+                if basename in ("Image", "bzImage") or basename.startswith("Image."):
                     gki_artifacts_srcs.append("{}/{}".format(name, out))
-                    compression = ""
-                elif basename.startswith("Image."):
-                    gki_artifacts_srcs.append("{}/{}".format(name, out))
-                    compression = utils.removeprefix(basename, "Image.")
 
             gki_artifacts(
                 name = name + "_gki_artifacts",
