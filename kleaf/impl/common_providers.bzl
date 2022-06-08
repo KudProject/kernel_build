@@ -12,30 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load(
-    "//build/kernel/kleaf:kernel.bzl",
-    "kernel_build_config",
-)
-load(":diff_test.bzl", "diff_test")
+# Providers that are provided by multiple rules in different extensions.
 
-kernel_build_config(
-    name = "test_build_config",
-    srcs = [
-        # do not sort
-        "build.config.2",
-        "build.config.1",
-    ],
-)
+KernelEnvInfo = provider(
+    doc = """Describe a generic environment setup with some dependencies and a setup script.
 
-diff_test(
-    name = "build_config_test",
-    actual = ":test_build_config",
-    expected = "build.config.expected",
-)
-
-test_suite(
-    name = "tests",
-    tests = [
-        ":build_config_test",
-    ],
+`KernelEnvInfo` is a legacy name; it is not only provided by `kernel_env`, but
+other rules like `kernel_config` and `kernel_build`. Hence, the `KernelEnvInfo`
+is in its own extension instead of `kernel_env.bzl`.
+    """,
+    fields = {
+        "dependencies": "dependencies required to use this environment setup",
+        "setup": "setup script to initialize the environment",
+    },
 )
