@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load(
     ":kernel.bzl",
     "kernel_build",
     "kernel_build_abi",
+    "kernel_build_abi_dist",
     "kernel_compile_commands",
     "kernel_filegroup",
     "kernel_images",
@@ -25,6 +27,13 @@ load(
     "kernel_unstripped_modules_archive",
 )
 load("//build/bazel_common_rules/dist:dist.bzl", "copy_to_dist_dir")
+load("//build/kernel/kleaf/impl:gki_artifacts.bzl", "gki_artifacts")
+load("//build/kernel/kleaf/impl:utils.bzl", "utils")
+load(
+    "//build/kernel/kleaf/impl:constants.bzl",
+    "MODULE_OUTS_FILE_OUTPUT_GROUP",
+    "MODULE_OUTS_FILE_SUFFIX",
+)
 load(
     ":constants.bzl",
     "CI_TARGET_MAPPING",
@@ -34,30 +43,39 @@ load(
     "x86_64_outs",
 )
 load(":print_debug.bzl", "print_debug")
-load("@kernel_toolchain_info//:dict.bzl", "BRANCH")
+load("@kernel_toolchain_info//:dict.bzl", "BRANCH", "common_kernel_package")
 
 _ARCH_CONFIGS = {
     "kernel_aarch64": {
+        "arch": "arm64",
         "build_config": "build.config.gki.aarch64",
         "outs": aarch64_outs,
     },
+    "kernel_aarch64_interceptor": {
+        "arch": "arm64",
+        "build_config": "build.config.gki.aarch64",
+        "outs": aarch64_outs,
+        "enable_interceptor": True,
+    },
     "kernel_aarch64_debug": {
+        "arch": "arm64",
         "build_config": "build.config.gki-debug.aarch64",
         "outs": aarch64_outs,
     },
     "kernel_x86_64": {
+        "arch": "x86_64",
         "build_config": "build.config.gki.x86_64",
         "outs": x86_64_outs,
     },
     "kernel_x86_64_debug": {
+        "arch": "x86_64",
         "build_config": "build.config.gki-debug.x86_64",
         "outs": x86_64_outs,
     },
 }
 
-# Valid configs of the value of the target_config argument in
-# `define_common_kernels`
-_TARGET_CONFIG_VALID_KEYS = [
+# Subset of _TARGET_CONFIG_VALID_KEYS for kernel_build_abi.
+_KERNEL_BUILD_ABI_VALID_KEYS = [
     "kmi_symbol_list",
     "additional_kmi_symbol_lists",
     "trim_nonlisted_kmi",
@@ -65,6 +83,13 @@ _TARGET_CONFIG_VALID_KEYS = [
     "abi_definition",
     "kmi_enforced",
     "module_outs",
+]
+
+# Valid configs of the value of the target_config argument in
+# `define_common_kernels`
+_TARGET_CONFIG_VALID_KEYS = _KERNEL_BUILD_ABI_VALID_KEYS + [
+    "build_gki_artifacts",
+    "gki_boot_img_sizes",
 ]
 
 # Always collect_unstripped_modules for common kernels.
@@ -120,13 +145,13 @@ def _default_target_configs():
         },
     }
 
-def _filter_keys(d, valid_keys, what):
+def _filter_keys(d, valid_keys, what = "", allow_unknown_keys = False):
     """Remove keys from `d` if the key is not in `valid_keys`.
 
     Fail if there are unknown keys in `d`.
     """
     ret = {key: value for key, value in d.items() if key in valid_keys}
-    if sorted(ret.keys()) != sorted(d.keys()):
+    if not allow_unknown_keys and sorted(ret.keys()) != sorted(d.keys()):
         fail("{what} contains invalid keys {invalid_keys}. Valid keys are: {valid_keys}".format(
             what = what,
             invalid_keys = [key for key in d.keys() if key not in valid_keys],
@@ -251,6 +276,8 @@ def define_common_kernels(
         - `TRIM_NONLISTED_KMI`
         - `KMI_SYMBOL_LIST_STRICT_MODE`
         - `GKI_MODULES_LIST` (corresponds to [`kernel_build.module_outs`](#kernel_build-module_outs))
+        - `BUILD_GKI_ARTIFACTS`
+        - `BUILD_GKI_BOOT_IMG_SIZE` and `BUILD_GKI_BOOT_IMG_{COMPRESSION}_SIZE`
 
         The keys of the `target_configs` may be one of the following:
         - `kernel_aarch64`
@@ -266,6 +293,13 @@ def define_common_kernels(
         - `trim_nonlisted_kmi`
         - `kmi_symbol_list_strict_mode`
         - `module_outs` (corresponds to `GKI_MODULES_LIST`)
+
+        In addition, the values of `target_configs` may contain the following keys:
+        - `build_gki_artifacts`
+        - `gki_boot_img_sizes` (corresponds to `BUILD_GKI_BOOT_IMG_SIZE` and `BUILD_GKI_BOOT_IMG_{COMPRESSION}_SIZE`)
+          - This is a dictionary where keys are lower-cased compression algorithm (e.g. `"lz4"`)
+            and values are sizes (e.g. `BUILD_GKI_BOOT_IMG_LZ4_SIZE`).
+            The empty-string key `""` corresponds to `BUILD_GKI_BOOT_IMG_SIZE`.
 
         A target is configured as follows. A configuration item for this target
         is determined by the following, in the following order:
@@ -378,10 +412,13 @@ def define_common_kernels(
         See [`visibility`](https://docs.bazel.build/versions/main/visibility.html).
     """
 
-    if branch == None and native.package_name() == "common":
+    if branch == None and native.package_name() == common_kernel_package:
         branch = BRANCH
     if branch == None:
-        fail("//{package}: define_common_kernels() must have branch argument.")
+        fail("//{package}: define_common_kernels() must have branch argument because @kernel_toolchain_info reads value from //{common_kernel_package}".format(
+            package = native.package_name(),
+            common_kernel_package = common_kernel_package,
+        ))
 
     if visibility == None:
         visibility = ["//visibility:public"]
@@ -432,6 +469,13 @@ def define_common_kernels(
         print_debug(
             name = name + "_print_configs",
             content = json.encode_indent(target_config, indent = "    ").replace("null", "None"),
+            tags = ["manual"],
+        )
+
+        kernel_build_abi_kwargs = _filter_keys(
+            target_config,
+            valid_keys = _KERNEL_BUILD_ABI_VALID_KEYS,
+            allow_unknown_keys = True,
         )
 
         kernel_build_abi(
@@ -447,14 +491,18 @@ def define_common_kernels(
                 "certs/signing_key.x509",
             ],
             build_config = arch_config["build_config"],
+            enable_interceptor = arch_config.get("enable_interceptor"),
             visibility = visibility,
             define_abi_targets = bool(target_config.get("kmi_symbol_list")),
             # Sync with KMI_SYMBOL_LIST_MODULE_GROUPING
             module_grouping = None,
             collect_unstripped_modules = _COLLECT_UNSTRIPPED_MODULES,
             toolchain_version = toolchain_version,
-            **target_config
+            **kernel_build_abi_kwargs
         )
+
+        if arch_config.get("enable_interceptor"):
+            continue
 
         kernel_modules_install(
             name = name + "_modules_install",
@@ -473,11 +521,29 @@ def define_common_kernels(
             kernel_modules_install = name + "_modules_install",
             # Sync with GKI_DOWNLOAD_CONFIGS, "additional_artifacts".
             build_system_dlkm = True,
-            deps = [
-                # Keep the following in sync with build.config.gki* MODULES_LIST
-                "android/gki_system_dlkm_modules",
-            ],
+            # Keep in sync with build.config.gki* MODULES_LIST
+            modules_list = "android/gki_system_dlkm_modules",
         )
+
+        if target_config.get("build_gki_artifacts"):
+            gki_artifacts_srcs = []
+            transformed_boot_img_sizes = {}
+            for out in arch_config["outs"]:
+                basename = paths.basename(out)
+                if basename in ("Image", "bzImage") or basename.startswith("Image."):
+                    gki_artifacts_srcs.append("{}/{}".format(name, out))
+
+            gki_artifacts(
+                name = name + "_gki_artifacts",
+                srcs = gki_artifacts_srcs,
+                boot_img_sizes = target_config.get("gki_boot_img_sizes", {}),
+                arch = arch_config["arch"],
+            )
+        else:
+            native.filegroup(
+                name = name + "_gki_artifacts",
+                srcs = [],
+            )
 
         # module_staging_archive from <name>
         native.filegroup(
@@ -496,6 +562,7 @@ def define_common_kernels(
                 name + "_modules_install",
                 name + "_images",
                 name + "_kmi_symbol_list",
+                name + "_gki_artifacts",
             ],
         )
 
@@ -526,13 +593,24 @@ def define_common_kernels(
             data = dist_targets,
             flat = True,
             dist_dir = "out/{branch}/dist".format(branch = BRANCH),
+            log = "info",
         )
 
-        copy_to_dist_dir(
+        kernel_build_abi_dist(
             name = name + "_abi_dist",
-            data = dist_targets + [name + "_abi"],
+            kernel_build_abi = name,
+            data = dist_targets,
             flat = True,
             dist_dir = "out_abi/{branch}/dist".format(branch = BRANCH),
+            log = "info",
+        )
+
+        native.test_suite(
+            name = name + "_tests",
+            tests = [
+                name + "_test",
+                name + "_modules_test",
+            ],
         )
 
     native.alias(
@@ -547,12 +625,12 @@ def define_common_kernels(
 
     kernel_compile_commands(
         name = "kernel_aarch64_compile_commands",
-        kernel_build = ":kernel_aarch64",
+        kernel_build = ":kernel_aarch64_interceptor",
     )
 
     kernel_kythe(
         name = "kernel_aarch64_kythe",
-        kernel_build = ":kernel_aarch64",
+        kernel_build = ":kernel_aarch64_interceptor",
         compile_commands = ":kernel_aarch64_compile_commands",
     )
 
@@ -591,6 +669,13 @@ def _define_prebuilts(**kwargs):
         native.filegroup(
             name = name + "_downloaded",
             srcs = ["@{}//{}".format(repo_name, filename) for filename in main_target_outs],
+            tags = ["manual"],
+        )
+
+        native.filegroup(
+            name = name + "_module_outs_file",
+            srcs = [":" + name],
+            output_group = MODULE_OUTS_FILE_OUTPUT_GROUP,
         )
 
         # A kernel_filegroup that:
@@ -615,6 +700,10 @@ def _define_prebuilts(**kwargs):
             kernel_srcs = [source_package_name + "_sources"],
             kernel_uapi_headers = source_package_name + "_uapi_headers_download_or_build",
             collect_unstripped_modules = _COLLECT_UNSTRIPPED_MODULES,
+            module_outs_file = select({
+                ":use_prebuilt_gki_set": "@{}//{}{}".format(repo_name, name, MODULE_OUTS_FILE_SUFFIX),
+                "//conditions:default": ":" + name + "_module_outs_file",
+            }),
             **kwargs
         )
 
@@ -625,6 +714,7 @@ def _define_prebuilts(**kwargs):
             native.filegroup(
                 name = name + "_" + target_suffix + "_downloaded",
                 srcs = ["@{}//{}".format(repo_name, filename) for filename in suffixed_target_outs],
+                tags = ["manual"],
             )
 
             # A filegroup that:
@@ -699,4 +789,5 @@ def define_db845c(
         ],
         dist_dir = dist_dir,
         flat = True,
+        log = "info",
     )

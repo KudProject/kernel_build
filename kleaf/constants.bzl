@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+load(
+    "//build/kernel/kleaf/impl:constants.bzl",
+    "MODULE_OUTS_FILE_OUTPUT_GROUP",
+    "MODULE_OUTS_FILE_SUFFIX",
+    "TOOLCHAIN_VERSION_FILENAME",
+)
+
 _common_outs = [
     "System.map",
     "modules.builtin",
@@ -70,8 +78,6 @@ GKI_DOWNLOAD_CONFIGS = [
     },
 ]
 
-TOOLCHAIN_VERSION_FILENAME = "toolchain_version"
-
 # Key: Bazel target name in common_kernels.bzl
 # repo_name: name of download_artifacts_repo in bazel.WORKSPACE
 # outs: list of outs associated with that target name
@@ -81,6 +87,7 @@ CI_TARGET_MAPPING = {
         "repo_name": "gki_prebuilts",
         "outs": aarch64_outs + [
             TOOLCHAIN_VERSION_FILENAME,
+            "kernel_aarch64" + MODULE_OUTS_FILE_SUFFIX,
         ],
     },
 }

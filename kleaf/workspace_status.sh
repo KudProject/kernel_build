@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Script used as --workspace_status_command.
+# Script used as --workspace_status_command with --config=stamp.
 # Must execute at the root of workspace.
 # https://docs.bazel.build/versions/main/command-line-reference.html#flag--workspace_status_command
 
@@ -22,4 +22,5 @@ if [[ ! -f "WORKSPACE" ]]; then
   exit 1
 fi
 
-build/kernel/build-tools/path/linux-x86/python3 build/kernel/kleaf/workspace_status.py
+build/kernel/kleaf/workspace_status_common.sh
+build/kernel/build-tools/path/linux-x86/python3 build/kernel/kleaf/workspace_status_stamp.py

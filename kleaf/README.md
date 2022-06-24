@@ -6,6 +6,12 @@
 
 [Building your kernels and drivers with Bazel](docs/impl.md)
 
+[`build.sh` build configs](docs/build_configs.md)
+
+[Support ABI monitoring (GKI)](docs/abi.md)
+
+[Support ABI monitoring (Device)](docs/abi_device.md)
+
 [Handling SCM version](docs/scmversion.md)
 
 [Resolving common errors](docs/errors.md)
@@ -23,3 +29,9 @@
 `--config=fast`: [Make local builds faster](docs/fast.md)
 
 `--config=local`: [Sandboxing](docs/sandbox.md)
+
+`--config=stamp`: [Handling SCM version](docs/scmversion.md)
+
+`--lto`: [Disable LTO during development](docs/lto.md)
+
+`--kbuild_symtypes`: [KBUILD\_SYMTYPES](docs/symtypes.md)

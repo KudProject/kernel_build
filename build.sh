@@ -284,6 +284,11 @@
 #     and resulting depmod artifacts. GKI build exclusive; DO NOT USE with device
 #     build configs files.
 #
+#   SYSTEM_DLKM_MODULES_LIST
+#     location (relative to the repo root directory) of an optional file
+#     containing the list of kernel modules which shall be copied into a
+#     system_dlkm partition image.
+#
 #   MODULES_OPTIONS
 #     A /lib/modules/modules.options file is created on the ramdisk containing
 #     the contents of this variable, lines should be of the form: options
@@ -408,9 +413,46 @@
 #     where the dts file path is
 #     common-modules/virtual-device/rk3399-rock-pi-4b.dts
 #
+#   BUILD_VENDOR_KERNEL_BOOT
+#     if set to "1", build a vendor_kernel_boot for kernel artifacts, such as kernel modules.
+#     Since we design this partition to isolate kernel artifacts from vendor_boot image,
+#     vendor_boot would not be repack and built if we set this property to "1".
+#
 #   BUILD_GKI_CERTIFICATION_TOOLS
 #     if set to "1", build a gki_certification_tools.tar.gz, which contains
 #     the utilities used to certify GKI boot-*.img files.
+#
+#   BUILD_GKI_ARTIFACTS
+#     if defined when $ARCH is arm64, build a boot-img.tar.gz archive that
+#     contains several GKI boot-*.img files with different kernel compression
+#     format. Each boot image contains a boot header v4 as per the format
+#     defined by https://source.android.com/devices/bootloader/boot-image-header
+#     , followed by a kernel (no ramdisk). The kernel binaries are from
+#     ${DIST_DIR}, e.g., Image, Image.gz, Image.lz4, etc. Individual
+#     boot-*.img files are also generated, e.g., boot.img, boot-gz.img and
+#     boot-lz4.img. It is expected that all components are present in
+#     ${DIST_DIR}.
+#
+#     if defined when $ARCH is x86_64, build a boot.img with the kernel image,
+#     bzImage under ${DIST_DIR}. No boot-img.tar.gz will be generated because
+#     currently there is only a x86_64 GKI image: the bzImage.
+#
+#     if defined when $ARCH is neither arm64 nor x86_64, print an error message
+#     then exist the build process.
+#
+#     When the BUILD_GKI_ARTIFACTS flag is defined, the following flags also
+#     need to be defined.
+#     - MKBOOTIMG_PATH=<path to the mkbootimg.py script which builds boot.img>
+#       (defaults to tools/mkbootimg/mkbootimg.py)
+#     - BUILD_GKI_BOOT_IMG_SIZE=<The size of the boot.img to build>
+#       This is required, and the file ${DIST_DIR}/Image must exist.
+#     - BUILD_GKI_BOOT_IMG_GZ_SIZE=<The size of the boot-gz.img to build>
+#       This is required only when ${DIST_DIR}/Image.gz is present.
+#     - BUILD_GKI_BOOT_IMG_LZ4_SIZE=<The size of the boot-lz4.img to build>
+#       This is required only when ${DIST_DIR}/Image.lz4 is present.
+#     - BUILD_GKI_BOOT_IMG_<COMPRESSION>_SIZE=<The size of the
+#       boot-${compression}.img to build> This is required
+#       only when ${DIST_DIR}/Image.${compression} is present.
 
 # Note: For historic reasons, internally, OUT_DIR will be copied into
 # COMMON_OUT_DIR, and OUT_DIR will be then set to
@@ -449,7 +491,7 @@ function build_super() {
   echo -e "super_partition_groups=kb_dynamic_partitions" >> ${super_props_file}
   echo -e "super_kb_dynamic_partitions_group_size=${group_size}" >> ${super_props_file}
 
-  for image in "${SUPER_IMAGE_CONTENTS}"; do
+  for image in "${SUPER_IMAGE_CONTENTS[@]}"; do
     echo "  Adding ${image}"
     partition_name=$(basename -s .img "${image}")
     dynamic_partitions="${dynamic_partitions} ${partition_name}"
@@ -473,24 +515,28 @@ source "${ROOT_DIR}/build/_setup_env.sh"
 
 (
     [[ "$KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING" == "1" ]] && exit 0 || true
-    echo     "************************************************************************" >&2
-    echo     "* WARNING: build.sh is deprecated for this branch. Please migrate to Bazel."
-    echo     "*   See build/kernel/kleaf/README.md"
-    echo -ne "*          Inferring equivalent Bazel command...\r"
+    echo     "Inferring equivalent Bazel command..."
     bazel_command_code=0
-    eq_bazel_command=$(${ROOT_DIR}/build/kernel/kleaf/convert_to_bazel.sh 2>&1) || bazel_command_code=$?
+    eq_bazel_command=$(
+        ${ROOT_DIR}/build/kernel/kleaf/convert_to_bazel.sh # error messages goes to stderr
+    ) || bazel_command_code=$?
+    echo     "*****************************************************************************" >&2
+    echo     "* WARNING: build.sh is deprecated for this branch. Please migrate to Bazel.  " >&2
+    echo     "*   See build/kernel/kleaf/README.md                                         " >&2
     if [[ $bazel_command_code -eq 0 ]]; then
-        echo "*          Possibly equivalent Bazel command:                           " >&2
+        echo "*          Possibly equivalent Bazel command:                                " >&2
         echo "*" >&2
         echo "*   \$ $eq_bazel_command" >&2
         echo "*" >&2
     else
-        echo "WARNING: Unable to infer an equivalent Bazel command." >&2
+        echo "WARNING: Unable to infer an equivalent Bazel command.                        " >&2
     fi
-    echo     "* To suppress this warning, set KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING=1"
-    echo     "************************************************************************" >&2
+    echo     "* To suppress this warning, set KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING=1" >&2
+    echo     "*****************************************************************************" >&2
     echo >&2
 )
+# Suppress deprecation warning for recursive build.sh invocation with GKI_BUILD_CONFIG
+export KLEAF_SUPPRESS_BUILD_SH_DEPRECATION_WARNING=1
 
 MAKE_ARGS=( "$@" )
 export MAKEFLAGS="-j$(nproc) ${MAKEFLAGS}"
@@ -738,7 +784,7 @@ fi
 if [ -n "${KMI_SYMBOL_LIST}" ]; then
   ${ROOT_DIR}/build/abi/process_symbols --out-dir="$DIST_DIR" --out-file=abi_symbollist \
     --report-file=abi_symbollist.report --in-dir="$ROOT_DIR/$KERNEL_DIR" \
-    "${KMI_SYMBOL_LIST}" ${ADDITIONAL_KMI_SYMBOL_LISTS} ${MSM_KMI_SYMBOL_LIST}
+    "${KMI_SYMBOL_LIST}" ${ADDITIONAL_KMI_SYMBOL_LISTS}
   pushd $ROOT_DIR/$KERNEL_DIR
   if [ "${TRIM_NONLISTED_KMI}" = "1" ]; then
       # Create the raw symbol list
@@ -802,8 +848,11 @@ if [ "${KMI_SYMBOL_LIST_STRICT_MODE}" = "1" ]; then
   echo "========================================================"
   echo " Comparing the KMI and the symbol lists:"
   set -x
-  ${ROOT_DIR}/build/abi/compare_to_symbol_list "${OUT_DIR}/Module.symvers" \
-                                               "${OUT_DIR}/abi_symbollist.raw"
+
+  gki_modules_list="${ROOT_DIR}/${KERNEL_DIR}/android/gki_system_dlkm_modules"
+  KMI_STRICT_MODE_OBJECTS="vmlinux $(sed 's/\.ko$//' ${gki_modules_list} | tr '\n' ' ')" \
+    ${ROOT_DIR}/build/abi/compare_to_symbol_list "${OUT_DIR}/Module.symvers"             \
+    "${OUT_DIR}/abi_symbollist.raw"
   set +x
 fi
 
@@ -921,6 +970,13 @@ for FILE in ${FILES}; do
   fi
 done
 
+if [ -f ${OUT_DIR}/vmlinux-gdb.py ]; then
+  echo "========================================================"
+  KERNEL_GDB_SCRIPTS_TAR=${DIST_DIR}/kernel-gdb-scripts.tar.gz
+  echo " Copying kernel gdb scripts to $KERNEL_GDB_SCRIPTS_TAR"
+  (cd $OUT_DIR && tar -czf $KERNEL_GDB_SCRIPTS_TAR --dereference vmlinux-gdb.py scripts/gdb/linux/*.py)
+fi
+
 for FILE in ${OVERLAYS_OUT}; do
   OVERLAY_DIST_DIR=${DIST_DIR}/$(dirname ${FILE#${OUT_DIR}/overlays/})
   echo "  ${FILE#${OUT_DIR}/}"
@@ -1025,10 +1081,11 @@ if [ "${BUILD_SYSTEM_DLKM}" = "1"  ]; then
   echo " Creating system_dlkm image"
 
   rm -rf ${SYSTEM_DLKM_STAGING_DIR}
-  create_modules_staging "${MODULES_LIST}" ${MODULES_STAGING_DIR} \
+  create_modules_staging "${SYSTEM_DLKM_MODULES_LIST:-${MODULES_LIST}}" ${MODULES_STAGING_DIR} \
     ${SYSTEM_DLKM_STAGING_DIR} "${MODULES_BLOCKLIST}" "-e"
 
   SYSTEM_DLKM_ROOT_DIR=$(echo ${SYSTEM_DLKM_STAGING_DIR}/lib/modules/*)
+  cp ${SYSTEM_DLKM_ROOT_DIR}/modules.load ${DIST_DIR}/system_dlkm.modules.load
   # Re-sign the stripped modules using kernel build time key
   find ${SYSTEM_DLKM_STAGING_DIR} -type f -name "*.ko" \
     -exec ${OUT_DIR}/scripts/sign-file sha1 \
@@ -1099,13 +1156,17 @@ if [ -n "${UNSTRIPPED_MODULES}" ]; then
   fi
 fi
 
-[ -n "${GKI_MODULES_LIST}" ] && cp ${KERNEL_DIR}/${GKI_MODULES_LIST} ${DIST_DIR}/
+[ -n "${GKI_MODULES_LIST}" ] && cp ${ROOT_DIR}/${KERNEL_DIR}/${GKI_MODULES_LIST} ${DIST_DIR}/
 
 echo "========================================================"
 echo " Files copied to ${DIST_DIR}"
 
 if [ -n "${BUILD_BOOT_IMG}" -o -n "${BUILD_VENDOR_BOOT_IMG}" ] ; then
   build_boot_images
+fi
+
+if [ -n "${BUILD_GKI_ARTIFACTS}" ] ; then
+  build_gki_artifacts
 fi
 
 if [ -n "${BUILD_DTBO_IMG}" ]; then

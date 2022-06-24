@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# TODO (b/231473697): rel_path and rel_path2 should use realpath --relative-to
 # rel_path <to> <from>
 # Generate relative directory path to reach directory <to> from <from>
 function rel_path() {
@@ -36,6 +37,17 @@ function rel_path() {
     path=${path}../
   done
   echo ${path}${to#$stem}
+}
+
+# TODO (b/231473697): rel_path and rel_path2 should use realpath --relative-to
+# rel_path2 <to> <from>
+# Generate relative directory path to reach directory <to> from <from>
+# This is slower than rel_path, but returns a simpler path when <from>
+# is directly under <to>.
+function rel_path2() {
+  local to=$1
+  local from=$2
+  python3 -c 'import os,sys;print(os.path.relpath(*(sys.argv[1:])))' "$to" "$from"
 }
 
 # $1 directory of kernel modules ($1/lib/modules/x.y)
@@ -247,8 +259,7 @@ function build_vendor_dlkm() {
     "${DIST_DIR}/vendor_dlkm.img" /dev/null
 }
 
-function build_boot_images() {
-  BOOT_IMAGE_HEADER_VERSION=${BOOT_IMAGE_HEADER_VERSION:-3}
+function check_mkbootimg_path() {
   if [ -z "${MKBOOTIMG_PATH}" ]; then
     MKBOOTIMG_PATH="tools/mkbootimg/mkbootimg.py"
   fi
@@ -256,7 +267,12 @@ function build_boot_images() {
     echo "mkbootimg.py script not found. MKBOOTIMG_PATH = ${MKBOOTIMG_PATH}"
     exit 1
   fi
+}
 
+function build_boot_images() {
+  check_mkbootimg_path
+
+  BOOT_IMAGE_HEADER_VERSION=${BOOT_IMAGE_HEADER_VERSION:-3}
   MKBOOTIMG_ARGS=("--header_version" "${BOOT_IMAGE_HEADER_VERSION}")
   if [ -n  "${BASE_ADDRESS}" ]; then
     MKBOOTIMG_ARGS+=("--base" "${BASE_ADDRESS}")
@@ -366,6 +382,12 @@ function build_boot_images() {
     MKBOOTIMG_ARGS+=("--kernel" "${DIST_DIR}/${KERNEL_BINARY}")
   fi
 
+  if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+     && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+    INIT_BOOT_IMAGE_FILENAME="init_boot.img"
+    MKINITBOOTIMG_ARGS+=("--output" "${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}")
+  fi
+
   if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ]; then
     if [ -n "${VENDOR_BOOTCONFIG}" ]; then
       for PARAM in ${VENDOR_BOOTCONFIG}; do
@@ -378,11 +400,22 @@ function build_boot_images() {
 
   if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "3" ]; then
     if [ -f "${GKI_RAMDISK_PREBUILT_BINARY}" ]; then
-      MKBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+      if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+         && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+        MKINITBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+        MKINITBOOTIMG_ARGS+=("--header_version" "${BOOT_IMAGE_HEADER_VERSION}")
+      else
+        MKBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+      fi
     fi
 
-    if [ -z "${SKIP_VENDOR_BOOT}" ]; then
-      MKBOOTIMG_ARGS+=("--vendor_boot" "${DIST_DIR}/vendor_boot.img")
+    if [ "${BUILD_VENDOR_KERNEL_BOOT}" = "1" ]; then
+      VENDOR_BOOT_NAME="vendor_kernel_boot.img"
+    elif [ -z "${SKIP_VENDOR_BOOT}" ]; then
+      VENDOR_BOOT_NAME="vendor_boot.img"
+    fi
+    if [ -n "${VENDOR_BOOT_NAME}" ]; then
+      MKBOOTIMG_ARGS+=("--vendor_boot" "${DIST_DIR}/${VENDOR_BOOT_NAME}")
       if [ -n "${KERNEL_VENDOR_CMDLINE}" ]; then
         MKBOOTIMG_ARGS+=("--vendor_cmdline" "${KERNEL_VENDOR_CMDLINE}")
       fi
@@ -418,6 +451,15 @@ function build_boot_images() {
 
   "${MKBOOTIMG_PATH}" "${MKBOOTIMG_ARGS[@]}"
 
+  if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+     && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+    "${MKBOOTIMG_PATH}" "${MKINITBOOTIMG_ARGS[@]}"
+  fi
+
+  if [ -n "${BUILD_INIT_BOOT_IMG}" -a -f "${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}" ]; then
+    echo "init_boot image created at ${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}"
+  fi
+
   if [ -n "${BUILD_BOOT_IMG}" -a -f "${DIST_DIR}/${BOOT_IMAGE_FILENAME}" ]; then
     echo "boot image created at ${DIST_DIR}/${BOOT_IMAGE_FILENAME}"
 
@@ -446,8 +488,8 @@ function build_boot_images() {
 
   if [ -z "${SKIP_VENDOR_BOOT}" ] \
     && [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "3" ] \
-    && [ -f "${DIST_DIR}/vendor_boot.img" ]; then
-      echo "vendor boot image created at ${DIST_DIR}/vendor_boot.img"
+    && [ -f "${DIST_DIR}/${VENDOR_BOOT_NAME}" ]; then
+      echo "Created ${VENDOR_BOOT_NAME} at ${DIST_DIR}/${VENDOR_BOOT_NAME}"
   fi
 }
 
@@ -458,4 +500,140 @@ function make_dtbo() {
     cd ${OUT_DIR}
     mkdtimg create "${DIST_DIR}"/dtbo.img ${MKDTIMG_FLAGS} ${MKDTIMG_DTBOS}
   )
+}
+
+# gki_get_boot_img_size <compression method>.
+# The function echoes the value of the preconfigured size variable
+# based on the input compression method.
+#   - (empty): echo ${BUILD_GKI_BOOT_IMG_SIZE}
+#   -      gz: echo ${BUILD_GKI_BOOT_IMG_GZ_SIZE}
+#   -     lz4: echo ${BUILD_GKI_BOOT_IMG_LZ4_SIZE}
+function gki_get_boot_img_size() {
+  local compression
+
+  if [ -z "$1" ]; then
+    boot_size_var="BUILD_GKI_BOOT_IMG_SIZE"
+  else
+    compression=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+    boot_size_var="BUILD_GKI_BOOT_IMG_${compression}_SIZE"
+  fi
+
+  if [ -z "${!boot_size_var}" ]; then
+    echo "ERROR: ${boot_size_var} is not set." >&2
+    exit 1
+  fi
+
+  echo "${!boot_size_var}"
+}
+
+# gki_add_avb_footer <image> <partition_size>
+function gki_add_avb_footer() {
+  avbtool add_hash_footer --image "$1" \
+    --partition_name boot --partition_size "$2"
+}
+
+function build_gki_artifacts_x86_64() {
+  kernel_path="${DIST_DIR}/bzImage"
+  boot_image_path="${DIST_DIR}/boot.img"
+
+  if ! [ -f "${kernel_path}" ]; then
+    echo "ERROR: '${kernel_path}' doesn't exist" >&2
+    exit 1
+  fi
+
+  GKI_MKBOOTIMG_ARGS=("--header_version" "4")
+  if [ -n "${GKI_KERNEL_CMDLINE}" ]; then
+    GKI_MKBOOTIMG_ARGS+=("--cmdline" "${GKI_KERNEL_CMDLINE}")
+  fi
+  GKI_MKBOOTIMG_ARGS+=("--kernel" "${kernel_path}")
+  GKI_MKBOOTIMG_ARGS+=("--output" "${boot_image_path}")
+  "${MKBOOTIMG_PATH}" "${GKI_MKBOOTIMG_ARGS[@]}"
+
+  gki_add_avb_footer "${boot_image_path}" "$(gki_get_boot_img_size)"
+}
+
+# gki_dry_run_certify_bootimg <boot_image> <gki_artifacts_info_file>
+# The certify_bootimg script will be executed on a server over a GKI
+# boot.img during the official certification process, which embeds
+# a GKI certificate into the boot.img. The certificate is for Android
+# VTS to verify that a GKI boot.img is authentic.
+# Dry running the process here so we can catch related issues early.
+function gki_dry_run_certify_bootimg() {
+  certify_bootimg --boot_img "$1" \
+    --algorithm SHA256_RSA4096 \
+    --key tools/mkbootimg/gki/testdata/testkey_rsa4096.pem \
+    --gki_info "$2" \
+    --output "$1"
+}
+
+# build_gki_artifacts_info <output_gki_artifacts_info_file>
+function build_gki_artifacts_info() {
+  local artifacts_info="certify_bootimg_extra_args=--prop ARCH:${ARCH} \
+--prop BRANCH:${BRANCH}"
+
+  if [ -n "${BUILD_NUMBER}" ]; then
+    artifacts_info="${artifacts_info} --prop BUILD_NUMBER:${BUILD_NUMBER}"
+  fi
+
+  KERNEL_RELEASE="$(cat "${OUT_DIR}"/include/config/kernel.release)"
+  artifacts_info="${artifacts_info} --prop KERNEL_RELEASE:${KERNEL_RELEASE}"
+
+  echo "${artifacts_info}" > "$1"
+}
+
+function build_gki_artifacts_aarch64() {
+  if ! [ -f "${DIST_DIR}/Image" ]; then
+    echo "ERROR: '${DIST_DIR}/Image' doesn't exist" >&2
+    exit 1
+  fi
+
+  DEFAULT_MKBOOTIMG_ARGS=("--header_version" "4")
+  if [ -n "${GKI_KERNEL_CMDLINE}" ]; then
+    DEFAULT_MKBOOTIMG_ARGS+=("--cmdline" "${GKI_KERNEL_CMDLINE}")
+  fi
+
+  GKI_ARTIFACTS_INFO_FILE="${DIST_DIR}/gki-info.txt"
+  build_gki_artifacts_info "${GKI_ARTIFACTS_INFO_FILE}"
+  local images_to_pack=("$(basename "${GKI_ARTIFACTS_INFO_FILE}")")
+
+  for kernel_path in "${DIST_DIR}"/Image*; do
+    GKI_MKBOOTIMG_ARGS=("${DEFAULT_MKBOOTIMG_ARGS[@]}")
+    GKI_MKBOOTIMG_ARGS+=("--kernel" "${kernel_path}")
+
+    kernel_image="$(basename "${kernel_path}")"
+    if [ "${kernel_image}" == "Image" ]; then
+        boot_image="boot.img"
+    else
+        compression="${kernel_image#Image.}"
+        boot_image="boot-${compression}.img"
+    fi
+
+    boot_image_path="${DIST_DIR}/${boot_image}"
+    GKI_MKBOOTIMG_ARGS+=("--output" "${boot_image_path}")
+    "${MKBOOTIMG_PATH}" "${GKI_MKBOOTIMG_ARGS[@]}"
+
+    gki_add_avb_footer "${boot_image_path}" \
+      "$(gki_get_boot_img_size "${compression}")"
+    gki_dry_run_certify_bootimg "${boot_image_path}" \
+      "${GKI_ARTIFACTS_INFO_FILE}"
+    images_to_pack+=("${boot_image}")
+  done
+
+  GKI_BOOT_IMG_ARCHIVE="boot-img.tar.gz"
+  echo "Creating ${GKI_BOOT_IMG_ARCHIVE} for" "${images_to_pack[@]}"
+  tar -czf "${DIST_DIR}/${GKI_BOOT_IMG_ARCHIVE}" -C "${DIST_DIR}" \
+    "${images_to_pack[@]}"
+}
+
+function build_gki_artifacts() {
+  check_mkbootimg_path
+
+  if [ "${ARCH}" = "arm64" ]; then
+    build_gki_artifacts_aarch64
+  elif [ "${ARCH}" = "x86_64" ]; then
+    build_gki_artifacts_x86_64
+  else
+    echo "ERROR: unknown ARCH to BUILD_GKI_ARTIFACTS: '${ARCH}'" >&2
+    exit 1
+  fi
 }

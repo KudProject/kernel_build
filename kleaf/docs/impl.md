@@ -93,10 +93,16 @@ build.config. This may include DTB files.
 The `module_outs` attribute of the target includes the list of in-tree drivers
 that you are building.
 
+* Hint: You may leave the list empty and build the target. If the list is not
+  up to date, modify the list according to the error message.
+
 **Note**: It is recommended that kernel modules are moved out of the kernel tree
 to be built as external kernel modules. This means keeping the list
 of `module_outs` empty or as short as possible. See Step 2 for building external
 kernel modules.
+
+For other build configurations defined in the `build.config` file, see
+[build_configs.md](build_configs.md).
 
 Example for Pixel 2021 (see the `kernel_build` target named `slider`):
 
@@ -111,6 +117,12 @@ in `build.config`.
 The `kernel_build` attribute should be the target to the `kernel_build` you have
 previously created in step 1, or  `//common:kernel_aarch64` if you did not do
 step 1.
+
+The `outs` attribute should be set to a list of `*.ko` files built by this
+external module.
+
+* Hint: You may leave the list empty and build the target. If the list is not
+  up to date, modify the list according to the error message.
 
 Be sure to set visibility accordingly, so that these targets are visible to
 the `kernel_modules_install` target that will be created in step 3.
@@ -165,7 +177,7 @@ Example for Pixel 2021 (see the `kernel_images` target named `slider_images`):
 
 [https://android.googlesource.com/kernel/google-modules/raviole-device/+/refs/heads/android-gs-raviole-mainline/BUILD.bazel](https://android.googlesource.com/kernel/google-modules/raviole-device/+/refs/heads/android-gs-raviole-mainline/BUILD.bazel)
 
-### Step 5: Define a target for distribution
+### Step 5: Define a target for distribution {#step-5}
 
 Define a `copy_to_dist_dir` target that includes the targets you want in the
 distribution directory. The name of this `copy_to_dist_dir` target is usually
@@ -245,49 +257,7 @@ See [scmversion.md](scmversion.md).
 
 ### Disable LTO during development
 
-**Warning**: You may want to re-enable LTO in production.
-
-Building with link-time optimization (LTO) may take a very long time that brings
-little benefit during development. You may disable LTO to shorten the build time
-for development purposes.
-
-#### Option 1: One-time build without LTO
-
-For example:
-
-```shell
-$ tools/bazel build --lto=none //private/path/to/sources:tuna_dist
-```
-
-The `--lto` option is applied to the build, not the `copy_to_dist_dir` step.
-Hence, put it before the `--` delimiter when running a `*_dist` target. For
-example:
-
-```shell
-$ tools/bazel run --lto=none //private/path/to/sources:tuna_dist -- --dist_dir=out/dist
-```
-
-#### Option 2: Disable LTO for this workspace
-
-You only need to **do this once** per workspace.
-
-```shell
-# Do this at workspace root next to the file WORKSPACE
-$ test -f WORKSPACE && echo 'build --lto=none' >> user.bazelrc
-# Future builds in this workspace always disables LTO.
-$ tools/bazel build //private/path/to/sources:tuna_dist
-```
-
-If you are using `--config=fast`, you need to add `build:fast --lto=none` as
-well, because `--config=fast` implies thin LTO. See [fast.md](fast.md#lto).
-
-#### Confirming the value of --lto
-
-You may build the following to confirm the value of LTO setting:
-
-```shell
-$ tools/bazel build //build/kernel/kleaf:print_flags
-```
+See [lto.md](lto.md).
 
 ### Using configurable build attributes `select()`
 
