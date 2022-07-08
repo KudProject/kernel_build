@@ -304,7 +304,7 @@ if [ "${COPY_NEEDED}" == "1" ]; then
       ${ANDROID_KERNEL_OUT}/vendor_dlkm/modules.blocklist
   fi
 
-  if [ -e ${ANDROID_KP_OUT_DIR}/dist/vendor_dlkm.modules.load ]; then
+  if [ -s ${ANDROID_KP_OUT_DIR}/dist/vendor_dlkm.modules.load ]; then
     cp ${ANDROID_KP_OUT_DIR}/dist/vendor_dlkm.modules.load \
       ${ANDROID_KERNEL_OUT}/vendor_dlkm/modules.load
   fi
