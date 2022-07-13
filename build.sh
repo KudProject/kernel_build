@@ -1165,7 +1165,8 @@ fi
 echo "========================================================"
 echo " Files copied to ${DIST_DIR}"
 
-if [ -n "${BUILD_BOOT_IMG}" -o -n "${BUILD_VENDOR_BOOT_IMG}" ] ; then
+if [ -n "${BUILD_BOOT_IMG}" -o -n "${BUILD_VENDOR_BOOT_IMG}" \
+      -o -n "${BUILD_VENDOR_KERNEL_BOOT}" ] ; then
   build_boot_images
 fi
 
