@@ -110,6 +110,11 @@ function sec_abl_image_generate() {
 }
 
 echo "========================================================"
+if [  "${SKIP_COMPILE_ABL}" == "1" ]; then
+  echo "*** WARN *** Skip bootloader compilation"
+  exit 0
+fi
+
 echo " Building abl"
 
 export ROOT_DIR=$(readlink -f $(dirname $0)/..)
@@ -157,11 +162,7 @@ mkdir -p ${ABL_IMAGE_DIR}
 . ${BUILD_CONFIG_ABL}
 
 # ABL ELF
-if [  "${SKIP_COMPILE_ABL}" != "1" ]; then
-  abl_image_generate
-else
-  echo "*** WARN *** Skip bootloader compilation"
-fi
+abl_image_generate
 
 #sec-image-generate
 if [ -e "${ABL_OUT_DIR}/unsigned_abl.elf" ]; then
