@@ -203,11 +203,15 @@ function create_modules_staging() {
     (
       cd ${dest_dir}
       if [ "${list_order}" = "1" ]; then
-        find * -type f -name "*.ko" > modules_name
-        sed -i 's/.*\///g' modules_name
-        grep -v -x -f modules.order modules_name > modules.name
-        find * -type f -name "*.ko" | grep -w -f modules.name -f $used_blocklist_modules - | xargs -r rm
-        rm -rf modules_name modules.name
+        find . -type f -name '*.ko' -printf "%f\n" > modules.name.full
+        cat modules.order $used_blocklist_modules > modules.name.need
+        grep -v -x -f modules.name.need modules.name.full > modules.name.remove
+        # This is done to insert escaped directory boundary '\/' in front of every line (eg \/a.ko)
+        # It is for matching entire module's name with 'grep -f' instead of 'grep -w -f'
+        # so that b-a.ko is not same with a.ko
+        sed -i 's/^/\\\/&/' modules.name.remove
+        find * -type f -name "*.ko" | grep -f modules.name.remove - | xargs -r rm
+        rm -rf modules.name.full modules.name.need modules.name.remove
       else
         find * -type f -name "*.ko" | grep -v -w -f modules.order -f $used_blocklist_modules - | xargs -r rm
      fi
