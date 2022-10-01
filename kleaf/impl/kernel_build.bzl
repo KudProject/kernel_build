@@ -29,6 +29,7 @@ load(
     "KernelBuildUapiInfo",
     "KernelEnvAttrInfo",
     "KernelEnvInfo",
+    "KernelImagesInfo",
     "KernelUnstrippedModulesInfo",
 )
 load(
@@ -685,6 +686,9 @@ def _kernel_build_impl(ctx):
              for ko in ${{remaining_ko_files}}; do
                echo '    "'"${{ko}}"'",' >&2
              done
+             echo "Alternatively, install buildozer and execute:" >&2
+             echo "  $ buildozer 'add module_outs ${{remaining_ko_files}}' {label}" >&2
+             echo "See https://github.com/bazelbuild/buildtools/blob/master/buildozer/README.md for reference" >&2
              exit 1
            fi
          # Clean up staging directories
@@ -775,9 +779,11 @@ def _kernel_build_impl(ctx):
         directory = unstripped_dir,
     )
 
-    base_kernel_info = KernelBuildInTreeModulesInfo(
+    in_tree_modules_info = KernelBuildInTreeModulesInfo(
         module_outs_file = all_module_names_file,
     )
+
+    images_info = KernelImagesInfo(base_kernel = ctx.attr.base_kernel)
 
     output_group_kwargs = {}
     for d in all_output_files.values():
@@ -804,7 +810,8 @@ def _kernel_build_impl(ctx):
         kernel_build_uapi_info,
         kernel_build_abi_info,
         kernel_unstripped_modules_info,
-        base_kernel_info,
+        in_tree_modules_info,
+        images_info,
         output_group_info,
         default_info,
     ]

@@ -203,11 +203,15 @@ function create_modules_staging() {
     (
       cd ${dest_dir}
       if [ "${list_order}" = "1" ]; then
-        find * -type f -name "*.ko" > modules_name
-        sed -i 's/.*\///g' modules_name
-        grep -v -x -f modules.order modules_name > modules.name
-        find * -type f -name "*.ko" | grep -w -f modules.name -f $used_blocklist_modules - | xargs -r rm
-        rm -rf modules_name modules.name
+        find . -type f -name '*.ko' -printf "%f\n" > modules.name.full
+        cat modules.order $used_blocklist_modules > modules.name.need
+        grep -v -x -f modules.name.need modules.name.full > modules.name.remove
+        # This is done to insert escaped directory boundary '\/' in front of every line (eg \/a.ko)
+        # It is for matching entire module's name with 'grep -f' instead of 'grep -w -f'
+        # so that b-a.ko is not same with a.ko
+        sed -i 's/^/\\\/&/' modules.name.remove
+        find * -type f -name "*.ko" | grep -f modules.name.remove - | xargs -r rm
+        rm -rf modules.name.full modules.name.need modules.name.remove
       else
         find * -type f -name "*.ko" | grep -v -w -f modules.order -f $used_blocklist_modules - | xargs -r rm
      fi
@@ -227,7 +231,7 @@ function build_system_dlkm() {
 
   rm -rf ${SYSTEM_DLKM_STAGING_DIR}
   create_modules_staging "${SYSTEM_DLKM_MODULES_LIST:-${MODULES_LIST}}" "${MODULES_STAGING_DIR}" \
-    ${SYSTEM_DLKM_STAGING_DIR} "${MODULES_BLOCKLIST}" "-e"
+    ${SYSTEM_DLKM_STAGING_DIR} "${SYSTEM_DLKM_MODULES_BLOCKLIST:-${MODULES_BLOCKLIST}}" "-e"
 
   local system_dlkm_root_dir=$(echo ${SYSTEM_DLKM_STAGING_DIR}/lib/modules/*)
   cp ${system_dlkm_root_dir}/modules.load ${DIST_DIR}/system_dlkm.modules.load
@@ -253,10 +257,16 @@ function build_system_dlkm() {
   fi
 
   # Re-sign the stripped modules using kernel build time key
-  find ${SYSTEM_DLKM_STAGING_DIR} -type f -name "*.ko" \
-    -exec ${OUT_DIR}/scripts/sign-file sha1 \
-    ${OUT_DIR}/certs/signing_key.pem \
-    ${OUT_DIR}/certs/signing_key.x509 {} \;
+  # If SYSTEM_DLKM_RE_SIGN=0, this is a trick in Kleaf for building
+  # device-specific system_dlkm image, where keys are not available but the
+  # signed and stripped modules are in MODULES_STAGING_DIR.
+  if [[ ${SYSTEM_DLKM_RE_SIGN:-1} == "1" ]]; then
+    for module in $(find ${SYSTEM_DLKM_STAGING_DIR} -type f -name "*.ko"); do
+      ${OUT_DIR}/scripts/sign-file sha1 \
+      ${OUT_DIR}/certs/signing_key.pem \
+      ${OUT_DIR}/certs/signing_key.x509 "${module}"
+    done
+  fi
 
   build_image "${SYSTEM_DLKM_STAGING_DIR}" "${system_dlkm_props_file}" \
     "${DIST_DIR}/system_dlkm.img" /dev/null
