@@ -221,8 +221,17 @@ if [ "${RECOMPILE_ABL}" == "1" -o "${COPY_ABL_NEEDED}" == "1" ]; then
   rm -rf ${ANDROID_ABL_OUT_DIR}/abl-${TARGET_BUILD_VARIANT}
 fi
 
+KP_DELIVERS_ABL=$(
+  cd ${ROOT_DIR}
+  OUT_DIR=${TEMP_KP_OUT_DIR}
+  source build/_wrapper_common.sh
+  echo ${ABL_SRC:+1}
+)
+
+
 ################################################################################
-if [ "${RECOMPILE_ABL}" == "1" -a -n "${TARGET_BUILD_VARIANT}" ]; then
+if [ "${RECOMPILE_ABL}" == "1" -a "${KP_DELIVERS_ABL}" == "1"  -a -n \
+   "${TARGET_BUILD_VARIANT}" ]; then
   echo
   echo "  Recompiling edk2"
 
