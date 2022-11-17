@@ -224,7 +224,7 @@ fi
 KP_DELIVERS_ABL=$(
   cd ${ROOT_DIR}
   OUT_DIR=${TEMP_KP_OUT_DIR}
-  source build/_wrapper_common.sh
+  source build/_setup_env.sh
   echo ${ABL_SRC:+1}
 )
 
