@@ -35,6 +35,7 @@ load(
 )
 load(
     ":constants.bzl",
+    "MODULES_STAGING_ARCHIVE",
     "MODULE_OUTS_FILE_OUTPUT_GROUP",
     "MODULE_OUTS_FILE_SUFFIX",
     "TOOLCHAIN_VERSION_FILENAME",
@@ -68,6 +69,7 @@ def kernel_build(
         deps = None,
         base_kernel = None,
         base_kernel_for_module_outs = None,
+        internal_additional_make_goals = None,
         kconfig_ext = None,
         dtstree = None,
         kmi_symbol_list = None,
@@ -134,6 +136,10 @@ def kernel_build(
 
           If set, this is used instead of `base_kernel` to determine the list
           of GKI modules.
+
+        internal_additional_make_goals: **INTERNAL ONLY; DO NOT SET!**
+
+          List of items added to `MAKE_GOALS`.
         generate_vmlinux_btf: If `True`, generates `vmlinux.btf` that is stripped of any debug
           symbols, but contains type and symbol information within a .BTF section.
           This is suitable for ABI analysis through BTF.
@@ -356,6 +362,7 @@ def kernel_build(
         srcs = srcs,
         toolchain_version = toolchain_version,
         kbuild_symtypes = kbuild_symtypes,
+        internal_additional_make_goals = internal_additional_make_goals,
         **internal_kwargs
     )
 
@@ -597,7 +604,7 @@ def _kernel_build_impl(ctx):
     )
 
     modules_staging_archive = ctx.actions.declare_file(
-        "{name}/modules_staging_dir.tar.gz".format(name = ctx.label.name),
+        "{}/{}".format(ctx.label.name, MODULES_STAGING_ARCHIVE),
     )
     out_dir_kernel_headers_tar = ctx.actions.declare_file(
         "{name}/out-dir-kernel-headers.tar.gz".format(name = ctx.label.name),
@@ -813,11 +820,17 @@ def _kernel_build_impl(ctx):
         trim_nonlisted_kmi = ctx.attr.trim_nonlisted_kmi,
         combined_abi_symbollist = ctx.file.combined_abi_symbollist,
         module_outs_file = all_module_names_file,
+        modules_staging_archive = modules_staging_archive,
     )
 
+    # Device modules takes precedence over base_kernel (GKI) modules.
+    unstripped_modules_depsets = []
+    if unstripped_dir:
+        unstripped_modules_depsets.append(depset([unstripped_dir]))
+    if ctx.attr.base_kernel:
+        unstripped_modules_depsets.append(ctx.attr.base_kernel[KernelUnstrippedModulesInfo].directories)
     kernel_unstripped_modules_info = KernelUnstrippedModulesInfo(
-        base_kernel = ctx.attr.base_kernel,
-        directory = unstripped_dir,
+        directories = depset(transitive = unstripped_modules_depsets, order = "postorder"),
     )
 
     in_tree_modules_info = KernelBuildInTreeModulesInfo(
