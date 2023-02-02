@@ -128,6 +128,9 @@ case "${KERNEL_TARGET}" in
   taro)
     KERNEL_TARGET="waipio"
     ;;
+  crow)
+    KERNEL_TARGET="kalama"
+    ;;
 esac
 
 ################################################################################
