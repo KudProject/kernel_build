@@ -35,6 +35,14 @@ function append_cmd() {
   fi
 }
 
+function pushd () {
+  command pushd "${@}" >/dev/null
+}
+
+function popd () {
+  command popd "${@}" >/dev/null
+}
+
 export KERNEL_DIR
 # for case that KERNEL_DIR is not specified in environment
 if [ -z "${KERNEL_DIR}" ]; then
