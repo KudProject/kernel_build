@@ -136,8 +136,7 @@ export USERCFLAGS USERLDFLAGS
 
 if [ "${HERMETIC_TOOLCHAIN:-0}" -eq 1 ]; then
   HOST_TOOLS=${OUT_DIR}/host_tools
-  rm -rf ${HOST_TOOLS}
-  mkdir -p ${HOST_TOOLS}
+  [ ! -e "${HOST_TOOLS}" ] && mkdir -p ${HOST_TOOLS}
   for tool in \
       bash \
       git \
@@ -180,9 +179,12 @@ for prebuilt_bin in "${prebuilts_paths[@]}"; do
         PATH=${ROOT_DIR}/${prebuilt_bin}:${PATH}
     fi
 done
-export PATH
+PATH=${COMMON_OUT_DIR}/host/bin:${PATH}
+LD_LIBRARY_PATH=${COMMON_OUT_DIR}/host/lib
 
-unset LD_LIBRARY_PATH
+export PATH
+export LD_LIBRARY_PATH
+
 unset PYTHONPATH
 unset PYTHONHOME
 unset PYTHONSTARTUP

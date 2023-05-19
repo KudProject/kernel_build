@@ -155,6 +155,7 @@ function create_modules_staging() {
   local modules_recoverylist_file=$5
   local modules_chargerlist_file=$6
   local depmod_flags=$7
+  local list_order=$8
 
   rm -rf ${dest_dir}
   mkdir -p ${dest_dir}/kernel
@@ -228,7 +229,12 @@ function create_modules_staging() {
 
     # grep the modules.order for any KOs in the modules list
     cp ${dest_dir}/modules.order ${old_modules_list}
-    ! grep -w -f ${modules_list_filter} ${old_modules_list} > ${dest_dir}/modules.order
+    if [ "${list_order}" = "1" ]; then
+      sed -i 's/.*\///g' ${old_modules_list}
+      ! grep -x -f ${old_modules_list} ${modules_list_filter} > ${dest_dir}/modules.order
+    else
+      ! grep -w -f ${modules_list_filter} ${old_modules_list} > ${dest_dir}/modules.order
+    fi
     if [[ -n "${modules_recoverylist_file}" ]]; then
       create_additional_modules_order "${modules_list_filter}" "${modules_recoverylist_file}" \
         "${old_modules_list}" "${dest_dir}/modules.order.recovery"
@@ -267,10 +273,22 @@ function create_modules_staging() {
     # Trim modules from tree that aren't mentioned in modules.order
     (
       cd ${dest_dir}
-      local grep_flags="-v -w -f modules.order -f ${used_blocklist_modules} "
-      [[ -f modules.order.recovery ]] && grep_flags+="-f modules.order.recovery "
-      [[ -f modules.order.charger ]] && grep_flags+="-f modules.order.charger "
-      find * -type f -name "*.ko" | (grep ${grep_flags} - || true) | xargs -r rm
+      if [ "${list_order}" = "1" ]; then
+        find . -type f -name '*.ko' -printf "%f\n" > modules.name.full
+        cat modules.order $used_blocklist_modules > modules.name.need
+        grep -v -x -f modules.name.need modules.name.full > modules.name.remove
+        # This is done to insert escaped directory boundary '\/' in front of every line (eg \/a.ko)
+        # It is for matching entire module's name with 'grep -f' instead of 'grep -w -f'
+        # so that b-a.ko is not same with a.ko
+        sed -i 's/^/\\\/&/' modules.name.remove
+        find * -type f -name "*.ko" | grep -f modules.name.remove - | xargs -r rm
+        rm -rf modules.name.full modules.name.need modules.name.remove
+      else
+        local grep_flags="-v -w -f modules.order -f ${used_blocklist_modules} "
+        [[ -f modules.order.recovery ]] && grep_flags+="-f modules.order.recovery "
+        [[ -f modules.order.charger ]] && grep_flags+="-f modules.order.charger "
+        find * -type f -name "*.ko" | (grep ${grep_flags} - || true) | xargs -r rm
+      fi
     )
     rm $used_blocklist_modules
   fi
@@ -372,6 +390,12 @@ function build_vendor_dlkm() {
   fi
 
   cp ${vendor_dlkm_modules_load} ${DIST_DIR}/vendor_dlkm.modules.load
+
+  if [ -e ${vendor_dlkm_modules_root_dir}/modules.blocklist ]; then
+    cp ${vendor_dlkm_modules_root_dir}/modules.blocklist \
+      ${DIST_DIR}/vendor_dlkm.modules.blocklist
+  fi
+
   local vendor_dlkm_props_file
 
   if [ -z "${VENDOR_DLKM_PROPS}" ]; then
@@ -519,6 +543,12 @@ function build_boot_images() {
     MKBOOTIMG_ARGS+=("--kernel" "${DIST_DIR}/${KERNEL_BINARY}")
   fi
 
+  if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+     && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+    INIT_BOOT_IMAGE_FILENAME="init_boot.img"
+    MKINITBOOTIMG_ARGS+=("--output" "${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}")
+  fi
+
   if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ]; then
     if [ -n "${VENDOR_BOOTCONFIG}" ]; then
       for PARAM in ${VENDOR_BOOTCONFIG}; do
@@ -531,7 +561,13 @@ function build_boot_images() {
 
   if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "3" ]; then
     if [ -f "${GKI_RAMDISK_PREBUILT_BINARY}" ]; then
-      MKBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+      if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+         && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+        MKINITBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+        MKINITBOOTIMG_ARGS+=("--header_version" "${BOOT_IMAGE_HEADER_VERSION}")
+      else
+        MKBOOTIMG_ARGS+=("--ramdisk" "${GKI_RAMDISK_PREBUILT_BINARY}")
+      fi
     fi
 
     if [ "${BUILD_VENDOR_KERNEL_BOOT}" = "1" ]; then
@@ -575,6 +611,15 @@ function build_boot_images() {
   done
 
   "${MKBOOTIMG_PATH}" "${MKBOOTIMG_ARGS[@]}"
+
+  if [ "${BOOT_IMAGE_HEADER_VERSION}" -ge "4" ] \
+     && [ -n "${BUILD_INIT_BOOT_IMG}" ]; then
+    "${MKBOOTIMG_PATH}" "${MKINITBOOTIMG_ARGS[@]}"
+  fi
+
+  if [ -n "${BUILD_INIT_BOOT_IMG}" -a -f "${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}" ]; then
+    echo "init_boot image created at ${DIST_DIR}/${INIT_BOOT_IMAGE_FILENAME}"
+  fi
 
   if [ -n "${BUILD_BOOT_IMG}" -a -f "${DIST_DIR}/${BOOT_IMAGE_FILENAME}" ]; then
     echo "boot image created at ${DIST_DIR}/${BOOT_IMAGE_FILENAME}"

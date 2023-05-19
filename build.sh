@@ -333,6 +333,13 @@
 #     VENDOR_DLKM_MODULES_LIST is), a default set of properties will be used
 #     which assumes an ext4 filesystem and a dynamic partition.
 #
+#   SUPER_IMAGE_CONTENTS
+#     A list of images to be added to a kernel/build generated super.img
+#     Partition names are derived from "basename -s .img $image"
+#
+#   SUPER_IMAGE_SIZE
+#     Size, in bytes, of the generated super.img
+#
 #   LZ4_RAMDISK
 #     if set to "1", any ramdisks generated will be lz4 compressed instead of
 #     gzip compressed.
@@ -471,6 +478,45 @@ set -e
 OLD_ENVIRONMENT=$(mktemp)
 export -p > ${OLD_ENVIRONMENT}
 
+# Save environment for ABL build support.
+ABL_OLD_ENVIRONMENT=$(mktemp)
+export -p > ${ABL_OLD_ENVIRONMENT}
+
+function build_super() {
+  echo "========================================================"
+  echo " Creating super.img"
+
+  local super_props_file=$(mktemp)
+  local dynamic_partitions=""
+  # Default to 256 MB
+  local super_image_size="$((${SUPER_IMAGE_SIZE:-268435456}))"
+  local group_size="$((${super_image_size} - 0x400000))"
+  echo -e "lpmake=lpmake" >> ${super_props_file}
+  echo -e "super_metadata_device=super" >> ${super_props_file}
+  echo -e "super_block_devices=super" >> ${super_props_file}
+  echo -e "super_super_device_size=${super_image_size}" >> ${super_props_file}
+  echo -e "super_partition_size=${super_image_size}" >> ${super_props_file}
+  echo -e "super_partition_groups=kb_dynamic_partitions" >> ${super_props_file}
+  echo -e "super_kb_dynamic_partitions_group_size=${group_size}" >> ${super_props_file}
+
+  for image in "${SUPER_IMAGE_CONTENTS[@]}"; do
+    echo "  Adding ${image}"
+    partition_name=$(basename -s .img "${image}")
+    dynamic_partitions="${dynamic_partitions} ${partition_name}"
+    echo -e "${partition_name}_image=${image}" >> ${super_props_file}
+  done
+
+  echo -e "dynamic_partition_list=${dynamic_partitions}" >> ${super_props_file}
+  echo -e "super_kb_dynamic_partitions_partition_list=${dynamic_partitions}" >> ${super_props_file}
+  build_super_image -v ${super_props_file} ${DIST_DIR}/super.img
+  rm ${super_props_file}
+
+  echo "super image created at ${DIST_DIR}/super.img"
+
+  simg2img ${DIST_DIR}/super.img ${DIST_DIR}/super_unsparsed.img
+  echo "Unsparsed super image created at ${DIST_DIR}/super_unsparsed.img"
+}
+
 export ROOT_DIR=$($(dirname $(readlink -f $0))/gettop.sh)
 source "${ROOT_DIR}/build/build_utils.sh"
 source "${ROOT_DIR}/build/_setup_env.sh"
@@ -544,6 +590,8 @@ if [ -n "${GKI_BUILD_CONFIG}" ]; then
   GKI_ENVIRON+=($(export -p | sed -n -E -e 's/.* GKI_([^=]+=.*)$/\1/p' | tr '\n' ' '))
   GKI_ENVIRON+=("OUT_DIR=${GKI_OUT_DIR}")
   GKI_ENVIRON+=("DIST_DIR=${GKI_DIST_DIR}")
+  # Clean ABL_SRC, there is no need to compile abl for GKI_BUILD
+  GKI_ENVIRON+=("ABL_SRC=")
   ( env -i bash -c "source ${OLD_ENVIRONMENT}; rm -f ${OLD_ENVIRONMENT}; export ${GKI_ENVIRON[*]} ; ./build/build.sh $*" ) || exit 1
 
   # Dist dir must have vmlinux.symvers, modules.builtin.modinfo, modules.builtin
@@ -608,6 +656,7 @@ if [ -n "${SKIP_IF_VERSION_MATCHES}" ]; then
   fi
 fi
 
+rm -rf ${DIST_DIR}
 mkdir -p ${OUT_DIR} ${DIST_DIR}
 
 if [ -n "${GKI_PREBUILTS_DIR}" ]; then
@@ -1022,7 +1071,8 @@ if [ -n "${MODULES}" ]; then
     rm -rf ${INITRAMFS_STAGING_DIR}
     create_modules_staging "${MODULES_LIST}" ${MODULES_STAGING_DIR} \
       ${INITRAMFS_STAGING_DIR} "${MODULES_BLOCKLIST}" "${MODULES_RECOVERY_LIST:-""}" \
-      "${MODULES_CHARGER_LIST:-""}" "-e"
+      "${MODULES_CHARGER_LIST:-""}" "-e" "${MODULES_LIST_ORDER}"
+
     MODULES_ROOT_DIR=$(echo ${INITRAMFS_STAGING_DIR}/lib/modules/*)
     if [ -n "${BUILD_VENDOR_BOOT_IMG}" ]; then
       VENDOR_BOOT_NAME="vendor_boot"
@@ -1036,6 +1086,9 @@ if [ -n "${MODULES}" ]; then
               cp ${MODULES_ROOT_DIR}/${file} ${DIST_DIR}/${VENDOR_BOOT_NAME}.${file}
     done
     echo "${MODULES_OPTIONS}" > ${MODULES_ROOT_DIR}/modules.options
+    if [ -e "${MODULES_ROOT_DIR}/modules.blocklist" ]; then
+      cp ${MODULES_ROOT_DIR}/modules.blocklist ${DIST_DIR}/modules.blocklist
+    fi
 
     mkbootfs "${INITRAMFS_STAGING_DIR}" >"${MODULES_STAGING_DIR}/initramfs.cpio"
     ${RAMDISK_COMPRESS} "${MODULES_STAGING_DIR}/initramfs.cpio" >"${DIST_DIR}/initramfs.img"
@@ -1046,8 +1099,40 @@ if [ "${BUILD_SYSTEM_DLKM}" = "1"  ]; then
   build_system_dlkm
 fi
 
+# Building abl.elf
+if [ -n "${ABL_SRC}" ]; then
+  if [ -e "${ROOT_DIR}/${ABL_SRC}" ]; then
+    if [ -n "${MSM_ARCH}" ]; then
+      [ -z "${TARGET_BUILD_VARIANT}" ] && TARGET_BUILD_VARIANT=userdebug
+      ABL_ENVIRON=("ABL_SRC=${ABL_SRC}")
+      ABL_ENVIRON+=("ABL_OUT_DIR=${COMMON_OUT_DIR}")
+      ABL_ENVIRON+=("ABL_IMAGE_DIR=${DIST_DIR}")
+      BUILD_VARIANTS=("${TARGET_BUILD_VARIANT}")
+      # Define COMPILE_ABL then need to compile userdebug and user abl
+      [ -n "${COMPILE_ABL}" ] && BUILD_VARIANTS=("userdebug" "user")
+      for variant in "${BUILD_VARIANTS[@]}"
+      do
+        ( env -i bash -c "source ${ABL_OLD_ENVIRONMENT}; \
+        export TARGET_BUILD_VARIANT=${variant}; \
+        export ${ABL_ENVIRON[*]} ; \
+        ./build/build_abl.sh ${MSM_ARCH}" )
+      done
+      if [ -e "${DIST_DIR}/abl_${TARGET_BUILD_VARIANT}.elf" ]; then
+        ln -sf ${DIST_DIR}/abl_${TARGET_BUILD_VARIANT}.elf ${DIST_DIR}/abl.elf
+      fi
+    else
+      echo "*** Warning *** Set a msm arch in build.confg.msm.kalama for compiling abl - ex: kalama"
+    fi
+  fi
+fi
+rm -f "${ABL_OLD_ENVIRONMENT}"
+
 if [ -n "${VENDOR_DLKM_MODULES_LIST}" ]; then
   build_vendor_dlkm
+fi
+
+if [ -n "${SUPER_IMAGE_CONTENTS}" ]; then
+  build_super
 fi
 
 if [ -n "${UNSTRIPPED_MODULES}" ]; then
